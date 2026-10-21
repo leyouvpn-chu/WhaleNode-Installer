@@ -7,7 +7,7 @@
 以 root 登录，用下面这一整行启动安装，**不要追加 `--help`**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.2.0/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.2.1/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
 ```
 
 下载地址不能直接作为 shell 命令执行。下载和执行必须使用同一个文件名。`--help` 只显示帮助，不会安装。
@@ -53,6 +53,8 @@ bash /root/whalenode-install.sh \
 | 查看帮助 | `bash /root/whalenode-install.sh --help` |
 | 只看资源和计划 | `bash /root/whalenode-install.sh --plan` |
 | 查看任务进度 | `bash /root/whalenode-install.sh --status` |
+| 安装后本机自检 | `bash /root/whalenode-install.sh --check` |
+| 导出脱敏验收报告 | `bash /root/whalenode-install.sh --check --report-file /root/whalenode-report.json` |
 | 失败后续跑 | `bash /root/whalenode-install.sh` |
 | 回滚本任务本机变更 | `bash /root/whalenode-install.sh --rollback` |
 
@@ -66,9 +68,17 @@ bash /root/whalenode-install.sh \
 
 ## 后端下载与安全边界
 
-仓库不提供 WhaleNode 后端二进制，也不包含运营方 API 地址或密钥。公开脚本本身不需要密码；**访问后端制品的权限由运营方下载服务控制**。支持 HTTPS 私有/签名下载 URL；本版本不提供 GitHub 私库登录或自建下载鉴权服务。
+仓库不提供 WhaleNode 后端二进制，也不包含运营方 API 地址或密钥。公开脚本本身不需要密码；**访问后端制品的权限由运营方下载服务控制**。支持 HTTPS 私有/签名下载 URL 和 Bearer 下载令牌；本版本不提供 GitHub 私库登录或自建下载鉴权服务。
 
-清单和制品 URL 保存在 root 专属任务状态中，不应使用公开永久链接承载需要保密的二进制。签名 URL 需要覆盖安装/续跑所需时间。清单与制品下载都禁止重定向，请提供最终 HTTPS 地址。下载服务如果要求专用鉴权请求头，需要先提供兼容的签名 URL。
+清单和制品 URL 保存在 root 专属任务状态中，不应使用公开永久链接承载需要保密的二进制。签名 URL 需要覆盖安装/续跑所需时间。清单与制品下载都禁止重定向，请提供最终 HTTPS 地址。下载服务使用 `Authorization: Bearer` 时，可执行：
+
+```bash
+bash /root/whalenode-install.sh --download-token-prompt
+```
+
+下载令牌隐藏输入，只存在本次进程内，不写入状态、配置或报告。自动化可用 `--download-token-file /root/download-token`，文件必须由 root 所有且无组/其他用户权限，例如 0600；符号链接不接受。此令牌与面板管理员令牌、节点 API Key 分开，不能互相替代。
+
+带下载令牌时，清单和制品必须同源（相同 HTTPS 主机和端口），跨域下载与重定向均拒绝；令牌不会转发给面板或 SNI 测试站点。下载服务还需自行验证令牌、限制权限及有效期。其他鉴权方式应由运营方提供兼容的签名 URL。
 
 示例清单（值均为占位符）：
 
@@ -116,6 +126,16 @@ python3 make_manifest.py --archive whalenode.gz \
 
 脚本不改云安全组或主机入站防火墙。HY2/AnyTLS 当前使用自签证书及面板 `insecure=1`，客户端应匹配这套配置。
 
+## 安装后自检与监控交接
+
+`--check` 不安装软件、不重启服务、不改规则；成功退出码为 0，任何必需检查失败退出码为 1。它检查服务是否运行、进程实际文件哈希、专用用户、配置权限、面板/节点绑定、各协议监听，以及 nftables 中首条规则是否确实拒绝专用用户 IPv6 出口。规则表存在但规则丢失，不能通过。已安装任务重复执行也会做这些检查。
+
+`--status` 和 `--check` 在未安装的新机器上不会创建任务目录；只读操作需要机器已有 Python 3.9+。
+
+`--report-file` 输出 JSON，采用字段白名单，不包含面板地址、API Key、管理员令牌、私有下载地址或下载令牌。文件权限 0600，已有路径或符号链接会拒绝覆盖。即使检查失败也会保留报告，便于定位。报告仍包含节点 IP、名称、节点 ID、版本和资源信息，仅交给可信运维人员，不要公开上传资产信息。
+
+报告明确标注 `scope=local_only`，外部 TCP/UDP、集中监控和节点发布均为 `not_verified`。运维端需要根据报告中的节点身份完成 Zabbix 登记、指标新鲜度检查和 Grafana 资产映射，再完成用户网络实测与发布；导出报告本身不会冒充这些步骤成功。
+
 ## 故障与回滚
 
 ```bash
@@ -138,7 +158,7 @@ bash /root/whalenode-install.sh --status
 
 ## 实测记录
 
-见 [安装与协议验收记录](TESTING.md)。只把实际测试过的系统、架构和网络范围列为已验证，不将发行版兼容入口当作测试结果。
+见 [基础安装与协议验收记录](TESTING.md) 和 [v0.2.1 自检与下载鉴权验收](TESTING-v0.2.1.md)。只把实际测试过的系统、架构和网络范围列为已验证，不将发行版兼容入口当作测试结果。
 
 ## 开发检查
 

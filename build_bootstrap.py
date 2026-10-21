@@ -26,6 +26,8 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --admin-token 凭据      面板管理员授权值，仅本次使用，不保存
   --api-key-file 文件     从本机文件读取节点密钥
   --admin-token-file 文件 从本机文件读取管理员凭据
+  --download-token-file 文件 私有下载 Bearer 令牌文件（root 专属，不保存令牌）
+  --download-token-prompt 隐藏输入私有下载令牌（不保存）
 
 可选参数：
   --protocols vless,hy2   协议多选，默认 VLESS+REALITY 与 HY2，另支持 anytls
@@ -35,6 +37,8 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --route-ids 5,11,12     面板路由组 ID，需核实后台实际配置
   --plan                 只查看资源与计划，不安装（需已有 Python 3.9+）
   --status               查看已保存的任务进度
+  --check                只读检查服务、端口、配置权限及 IPv6 出口规则
+  --report-file 文件      配合 --check 导出脱敏 JSON 报告（必须是新文件）
   --rollback             停止本任务服务，恢复本任务修改的系统参数
   --non-interactive      禁止询问，缺参数直接报错
   --help                 显示本帮助
@@ -56,7 +60,7 @@ case "$ID" in
 esac
 read_only=false
 for arg in "$@"; do
-  [[ "$arg" != "--plan" && "$arg" != "--status" ]] || read_only=true
+  [[ "$arg" != "--plan" && "$arg" != "--status" && "$arg" != "--check" ]] || read_only=true
 done
 if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>/dev/null; then
   [[ "$read_only" == false ]] || { echo '只读操作需要已有 Python 3.9+' >&2; exit 1; }

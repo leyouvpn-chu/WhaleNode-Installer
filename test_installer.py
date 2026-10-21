@@ -99,4 +99,83 @@ class Tests(unittest.TestCase):
         self.assertEqual(args.api_url,'https://api.test')
         self.assertEqual(state['binary_sha256'],'a'*64)
 
+class DiagnosticsTests(unittest.TestCase):
+    def state(self):
+        return {'ids':{'hy2':7},'protocols':['hy2'],'api_url':'https://private-panel.test','admin_token':'DO-NOT-EXPORT','binary_url':'https://files.test/?token=DO-NOT-EXPORT','binary_sha256':'a'*64,'name':'test','phase':'installed'}
+    def test_read_only_and_rollback_modes_cannot_be_mixed(self):
+        with patch('sys.stderr',new_callable=io.StringIO):
+            for flags in [['--check','--plan'],['--rollback','--status']]:
+                with self.assertRaises(SystemExit):i.parser().parse_args(flags)
+    def test_status_on_new_machine_is_read_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'absent'
+            with patch.object(i.os,'geteuid',return_value=0),patch.object(i,'ROOT',root),patch('sys.stdout',new_callable=io.StringIO):
+                i.main(['--status'])
+            self.assertFalse(root.exists())
+    def test_check_failure_is_nonzero_without_creating_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'absent'
+            with patch.object(i.os,'geteuid',return_value=0),patch.object(i,'ROOT',root),patch.object(i,'diagnose',return_value={'checks':[],'passed':False}),patch('sys.stdout',new_callable=io.StringIO):
+                with self.assertRaises(RuntimeError):i.main(['--check'])
+            self.assertFalse(root.exists())
+    def test_report_excludes_credentials_and_cannot_overwrite(self):
+        with patch.object(i,'run',side_effect=OSError('unavailable')):
+            report=i.diagnose(self.state())
+        raw=json.dumps(report)
+        self.assertNotIn('DO-NOT-EXPORT',raw)
+        self.assertNotIn('private-panel',raw)
+        self.assertFalse(report['passed'])
+        self.assertEqual(report['external_tcp_udp'],'not_verified')
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'report.json'
+            i.export_report(path,report)
+            self.assertEqual(path.stat().st_mode & 0o777,0o600)
+            with self.assertRaises(ValueError):i.export_report(path,{'changed':True})
+            self.assertEqual(json.loads(path.read_text()),report)
+    def test_table_without_reject_rule_is_failure(self):
+        from types import SimpleNamespace
+        def run(*args,**kwargs):
+            data=json.dumps({'nftables':[{'chain':{'name':'output','hook':'output','type':'filter'}}]}) if args[0]=='nft' else ''
+            return SimpleNamespace(stdout=data,returncode=0)
+        with patch.object(i,'run',side_effect=run),patch.object(i.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=991)):
+            report=i.diagnose(self.state())
+        self.assertFalse(next(x['passed'] for x in report['checks'] if x['key']=='ipv6_rule'))
+    def test_correct_ipv6_rule_and_preceding_accept(self):
+        from types import SimpleNamespace
+        rule={'rule':{'chain':'output','expr':[{'match':{'op':'==','left':{'meta':{'key':'skuid'}},'right':991}},{'match':{'op':'==','left':{'meta':{'key':'nfproto'}},'right':'ipv6'}},{'counter':{'packets':2,'bytes':120}},{'reject':{'type':'icmpx','expr':'port-unreachable'}}]}}
+        chain={'chain':{'name':'output','hook':'output','type':'filter'}}
+        for preceding,expected in [([],True),([{'rule':{'chain':'output','expr':[{'accept':None}]}}],False)]:
+            def run(*args,**kwargs):
+                return SimpleNamespace(stdout=json.dumps({'nftables':[chain]+preceding+[rule]}) if args[0]=='nft' else '',returncode=0)
+            with patch.object(i,'run',side_effect=run),patch.object(i.pwd,'getpwnam',return_value=SimpleNamespace(pw_uid=991)):
+                report=i.diagnose(self.state())
+            self.assertEqual(next(x['passed'] for x in report['checks'] if x['key']=='ipv6_rule'),expected)
+
+class DownloadAuthTests(unittest.TestCase):
+    def test_token_origin_scope(self):
+        args=i.parser().parse_args([]);args._download_token='secret'
+        self.assertEqual(i.download_auth(args,'https://Files.test:443/binary','https://files.test/manifest'),'Bearer secret')
+        for url in ['https://other.test/binary','https://files.test:444/binary','http://files.test/binary']:
+            with self.assertRaises((ValueError,RuntimeError)):i.download_auth(args,url,'https://files.test/manifest')
+    def test_hidden_token_is_not_a_state_field(self):
+        args=i.parser().parse_args(['--download-token-prompt'])
+        with patch.object(i.getpass,'getpass',return_value='secret'):
+            i.prepare_download_auth(args)
+        self.assertEqual(args._download_token,'secret')
+        with patch.object(i.getpass,'getpass',return_value='secret\r\nX: injected'):
+            with self.assertRaises(ValueError):i.prepare_download_auth(args)
+    def test_noninteractive_cannot_prompt_for_download_token(self):
+        args=i.parser().parse_args(['--non-interactive','--download-token-prompt'])
+        with self.assertRaises(ValueError):i.prepare_download_auth(args)
+    def test_readable_token_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'token';path.write_text('secret');path.chmod(0o644)
+            args=i.parser().parse_args(['--download-token-file',str(path)])
+            with self.assertRaises(ValueError):i.prepare_download_auth(args)
+    def test_authenticated_manifest_uses_download_auth_only(self):
+        entry={'url':'https://files.test/binary','sha256':'a'*64,'source_commit':'b'*40}
+        with patch.object(i,'request',return_value={'schema':1,'architectures':{'amd64':entry}}) as request:
+            i.manifest('https://files.test/manifest','x86_64',token='Bearer download')
+        request.assert_called_once_with('https://files.test/manifest','Bearer download')
+
 if __name__=='__main__':unittest.main()

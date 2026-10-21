@@ -23,6 +23,8 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --admin-token 凭据      面板管理员授权值，仅本次使用，不保存
   --api-key-file 文件     从本机文件读取节点密钥
   --admin-token-file 文件 从本机文件读取管理员凭据
+  --download-token-file 文件 私有下载 Bearer 令牌文件（root 专属，不保存令牌）
+  --download-token-prompt 隐藏输入私有下载令牌（不保存）
 
 可选参数：
   --protocols vless,hy2   协议多选，默认 VLESS+REALITY 与 HY2，另支持 anytls
@@ -32,6 +34,8 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --route-ids 5,11,12     面板路由组 ID，需核实后台实际配置
   --plan                 只查看资源与计划，不安装（需已有 Python 3.9+）
   --status               查看已保存的任务进度
+  --check                只读检查服务、端口、配置权限及 IPv6 出口规则
+  --report-file 文件      配合 --check 导出脱敏 JSON 报告（必须是新文件）
   --rollback             停止本任务服务，恢复本任务修改的系统参数
   --non-interactive      禁止询问，缺参数直接报错
   --help                 显示本帮助
@@ -53,7 +57,7 @@ case "$ID" in
 esac
 read_only=false
 for arg in "$@"; do
-  [[ "$arg" != "--plan" && "$arg" != "--status" ]] || read_only=true
+  [[ "$arg" != "--plan" && "$arg" != "--status" && "$arg" != "--check" ]] || read_only=true
 done
 if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>/dev/null; then
   [[ "$read_only" == false ]] || { echo '只读操作需要已有 Python 3.9+' >&2; exit 1; }
@@ -84,6 +88,8 @@ import shutil
 import socket
 import ssl
 import platform
+import pwd
+import stat
 import subprocess
 import sys
 import tempfile
@@ -183,11 +189,16 @@ def parser():
     p.add_argument('--group-ids')
     p.add_argument('--route-ids')
     p.add_argument('--sni', default=None, help='可选；指定已测试可用的 TLS 域名')
-    p.add_argument('--status', action='store_true')
-    p.add_argument('--plan', action='store_true')
+    mode=p.add_mutually_exclusive_group()
+    mode.add_argument('--status', action='store_true')
+    mode.add_argument('--check', action='store_true', help='只读检查运行文件、监听、配置权限及 IPv6 出口规则')
+    p.add_argument('--report-file', type=Path, help='配合 --check 输出不含凭据的 JSON 验收报告')
+    p.add_argument('--download-token-file', type=Path, help='私有下载 Bearer 令牌文件，仅本次使用')
+    p.add_argument('--download-token-prompt', action='store_true', help='隐藏输入私有下载 Bearer 令牌')
+    mode.add_argument('--plan', action='store_true')
     p.add_argument('--non-interactive', action='store_true', help='禁止交互，缺少参数时直接报错')
     p.add_argument('--release-manifest', help='HTTPS 发布清单，自动选择架构及校验值')
-    p.add_argument('--rollback', action='store_true', help='停止本任务服务并恢复本任务修改的系统参数；保留隐藏面板节点')
+    mode.add_argument('--rollback', action='store_true', help='停止本任务服务并恢复本任务修改的系统参数；保留隐藏面板节点')
     return p
 
 def prompt(text, default='', required=False):
@@ -204,11 +215,41 @@ def prompt(text, default='', required=False):
     except OSError:
         raise RuntimeError('没有交互终端，请通过参数提供配置或使用 SSH 终端执行') from None
 
-def manifest(url, machine=None):
+def origin(url):
+    p=urllib.parse.urlsplit(https(url))
+    return (p.scheme,p.hostname.lower(),p.port or 443)
+
+def download_auth(args, url, allowed_origin):
+    token=getattr(args,'_download_token',None)
+    if not token:return None
+    if origin(url)!=origin(allowed_origin):
+        raise RuntimeError('私有制品下载地址与鉴权来源不同，拒绝转发下载令牌')
+    return 'Bearer '+token
+
+def prepare_download_auth(args):
+    if args.download_token_file and args.download_token_prompt:
+        raise ValueError('下载令牌文件和隐藏输入不能同时使用')
+    if args.download_token_prompt and args.non_interactive:
+        raise ValueError('非交互模式请使用 --download-token-file')
+    token=None
+    if args.download_token_file:
+        fd=os.open(args.download_token_file,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd) as f:
+            mode=os.fstat(f.fileno())
+            if not stat.S_ISREG(mode.st_mode) or mode.st_uid!=0 or mode.st_mode & 0o077:
+                raise ValueError('下载令牌文件必须由 root 所有，且不可被组或其他用户读取')
+            token=f.read(8193).strip()
+    elif args.download_token_prompt:
+        token=getpass.getpass('请输入私有下载令牌（隐藏输入，不保存）：')
+    if token is not None and (not token or len(token)>8192 or any(ord(c)<33 or ord(c)>126 for c in token)):
+        raise ValueError('下载令牌格式无效')
+    args._download_token=token
+
+def manifest(url, machine=None, token=None):
     machine=machine or platform.machine()
     arch={'x86_64':'amd64','aarch64':'arm64'}.get(machine)
     if not arch:raise ValueError('不支持的 CPU 架构：'+machine)
-    doc=request(url)
+    doc=request(url,token) if token else request(url)
     entry=doc.get('architectures',{}).get(arch)
     if doc.get('schema')!=1 or not isinstance(entry,dict):raise ValueError('发布清单未提供当前架构：'+arch)
     https(entry.get('url',''))
@@ -238,7 +279,8 @@ def wizard(args,state):
         if state.get('release_manifest') and release!=state['release_manifest'] and state.get('ids'):
             raise ValueError('续跑不能更换已使用的发布清单')
         if not all(state.get(k) for k in ('binary_url','binary_sha256','source_commit')):
-            state.update(manifest(release))
+            auth=download_auth(args,release,release)
+            state.update(manifest(release,token=auth) if auth else manifest(release))
         state['release_manifest']=release
     else:
         for name,label in [('binary_sha256','可执行文件 SHA256'),('source_commit','完整源码提交 SHA')]:
@@ -281,13 +323,75 @@ def rollback(state):
     state['phase']='rolled_back';atomic(ROOT/'state.json',json.dumps(state,ensure_ascii=False,indent=2))
     print('已停止本任务服务、移除本任务规则并恢复系统参数。配置和隐藏面板节点保留，便于核查及续跑。')
 
+def active(unit):
+    return run('systemctl','is-active','--quiet',unit,check=False).returncode==0
+
+def export_report(path,report):
+    # Never overwrite config, another report or a symlink with a diagnostic report.
+    raw=json.dumps(report,ensure_ascii=False,indent=2).encode('utf-8')
+    try:fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    except FileExistsError:raise ValueError('报告文件已存在，请使用新的文件名；未覆盖已有内容') from None
+    except OSError:raise RuntimeError('无法创建报告，请检查目标目录及写入权限') from None
+    with os.fdopen(fd,'wb') as f:
+        f.write(raw);f.flush();os.fsync(f.fileno())
+
+def diagnose(state):
+    checks=[]
+    def check(key,label,fn):
+        try:passed=bool(fn())
+        except Exception:passed=False
+        checks.append({'key':key,'label':label,'passed':passed})
+    check('state','存在本机安装任务',lambda:bool(state.get('ids')))
+    check('backend_active','WhaleNode 服务运行',lambda:active('whalenode.service'))
+    def running_hash():
+        pid=run('systemctl','show','whalenode.service','--property=MainPID','--value').stdout.strip()
+        if not pid.isdigit() or int(pid)==0:return False
+        return hashlib.sha256(Path('/proc/'+pid+'/exe').read_bytes()).hexdigest()==state.get('binary_sha256')
+    check('running_hash','运行文件 SHA256 与已校验制品一致',running_hash)
+    def service_user():
+        return run('systemctl','show','whalenode.service','--property=User','--value').stdout.strip()=='whalenode'
+    check('service_user','后端使用专用非 root 用户',service_user)
+    def private_config():
+        uid=pwd.getpwnam('whalenode').pw_uid
+        files=[(CONF,0o700),(CONF/'config.json',0o600),(CONF/'sing_original.json',0o600)]
+        return all(not p.is_symlink() and p.stat().st_uid==uid and stat.S_IMODE(p.stat().st_mode)==mode for p,mode in files)
+    check('config_permissions','后端配置属主及私密权限正确',private_config)
+    def config_binding():
+        nodes=json.loads((CONF/'config.json').read_text()).get('Nodes',[])
+        expected={('hysteria2' if p=='hy2' else p,int(n)) for p,n in state.get('ids',{}).items()}
+        return bool(expected) and len(nodes)==len(expected) and {(n.get('NodeType'),n.get('NodeID')) for n in nodes}==expected and all(n.get('ApiHost')==state.get('api_url') and n.get('ApiKey') for n in nodes)
+    check('config_binding','配置中的面板与节点 ID 对应当前任务',config_binding)
+    check('egress_active','IPv6 出口规则服务运行',lambda:active('whalenode-egress.service'))
+    def ipv6_rule():
+        uid=pwd.getpwnam('whalenode').pw_uid
+        document=json.loads(run('nft','-j','list','table','inet','whalenode_egress').stdout)
+        entries=document.get('nftables',[])
+        chains=[x['chain'] for x in entries if 'chain' in x]
+        if not any(c.get('name')=='output' and c.get('hook')=='output' and c.get('type')=='filter' for c in chains):return False
+        rules=[x['rule'] for x in entries if 'rule' in x and x['rule'].get('chain')=='output']
+        # Require the first rule to be our UID + IPv6 reject; an earlier accept could bypass it.
+        if not rules:return False
+        expr=rules[0].get('expr',[])
+        matches=[e['match'] for e in expr if 'match' in e]
+        if len(matches)!=2 or any(not ('match' in e or 'counter' in e or 'reject' in e) for e in expr):return False
+        def matches_meta(key,values):
+            return any(m.get('op')=='==' and m.get('left')=={'meta':{'key':key}} and m.get('right') in values for m in matches)
+        return matches_meta('skuid',(uid,str(uid),'whalenode')) and matches_meta('nfproto',('ipv6',10)) and any('reject' in e for e in expr)
+    check('ipv6_rule','首条出口规则拒绝专用用户的 IPv6 流量',ipv6_rule)
+    for proto in state.get('protocols',[]):
+        if proto not in PROTOCOLS:
+            check('protocol_unknown','任务中存在未知协议',lambda:False);continue
+        sock='-lun' if proto=='hy2' else '-ltn'
+        check('listen_'+proto,proto.upper()+' 协议端口已监听',lambda sock=sock,proto=proto:len(run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines())>1)
+    return {'schema':1,'generated_at':int(time.time()),'scope':'local_only','passed':bool(checks) and all(x['passed'] for x in checks),
+            'node':{k:state.get(k) for k in ('host','name','protocols','ids','phase','resources','source_commit','binary_sha256')},
+            'checks':checks,'external_tcp_udp':'not_verified','central_monitoring':'not_verified','publication':'not_verified'}
+
 def verify_service(state):
-    run('systemctl','is-active','--quiet','whalenode.service')
-    pid=run('systemctl','show','whalenode.service','--property=MainPID','--value').stdout.strip()
-    if not pid.isdigit() or int(pid)==0:raise RuntimeError('服务进程不存在')
-    if hashlib.sha256(Path('/proc/'+pid+'/exe').read_bytes()).hexdigest()!=state['binary_sha256']:
-        raise RuntimeError('正在运行的后端与已校验发布包不一致')
-    run('nft','list','table','inet','whalenode_egress')
+    report=diagnose(state)
+    failed=[item['label'] for item in report['checks'] if not item['passed']]
+    if failed:raise RuntimeError('本机验收失败：'+'；'.join(failed))
+
 
 def rows(response):
     data = response.get('data')
@@ -298,10 +402,26 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if os.geteuid() != 0: raise RuntimeError('请使用 root 或 sudo 运行')
     os.umask(0o077)
+    if args.report_file and not args.check:raise ValueError('--report-file 必须与 --check 一起使用')
     if args.plan:
         selected = (args.protocols or 'vless,hy2').split(',')
         if any(p not in PROTOCOLS for p in selected): raise ValueError('支持的协议：vless,hy2,anytls')
         print(json.dumps({'protocols': selected, 'resources': resources(), 'publication': '保持隐藏，等待公网协议测试、产品分组和监控验收'}, ensure_ascii=False, indent=2))
+        return
+    if args.status or args.check:
+        if args.status and args.check:raise ValueError('--status 和 --check 只能选择一个')
+        state_path=ROOT/'state.json'
+        state=json.loads(state_path.read_text()) if state_path.exists() else {}
+        if args.status:
+            print(json.dumps({k:state.get(k) for k in ('host','name','protocols','ids','phase','resources')},ensure_ascii=False,indent=2))
+            return
+        report=diagnose(state)
+        if args.report_file:
+            export_report(args.report_file,report)
+        for item in report['checks']:
+            print(('通过' if item['passed'] else '失败')+'：'+item['label'])
+        print('本机自检不代表公网 TCP/UDP 或集中监控验收通过。')
+        if not report['passed']:raise RuntimeError('本机自检未通过，请按失败项目排查；未修改服务或配置')
         return
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(ROOT / 'lock', 'w')
@@ -311,9 +431,6 @@ def main(argv=None):
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     if args.rollback:
         rollback(state);return
-    if args.status:
-        print(json.dumps({k: state.get(k) for k in ('host','name','protocols','ids','phase','resources')}, ensure_ascii=False, indent=2))
-        return
     if state.get('phase')=='installed':
         if run('systemctl','is-active','--quiet','whalenode.service',check=False).returncode:
             raise RuntimeError('任务记录已安装，但服务没有运行；请检查 journalctl -u whalenode，再执行 --rollback 后续跑')
@@ -330,6 +447,7 @@ def main(argv=None):
     if not state and any(Path(p).exists() for p in (str(CONF),'/etc/systemd/system/whalenode.service','/etc/systemd/system/whalenode-egress.service','/etc/sysctl.d/90-whalenode.conf','/etc/whalenode-egress.nft')):
         raise RuntimeError('发现已有 WhaleNode 文件，请检查后再安装')
     print('WhaleNode 中文安装向导。已有参数自动采用，密钥隐藏输入。',flush=True)
+    prepare_download_auth(args)
     wizard(args,state)
     selected = list(dict.fromkeys(x.strip().lower() for x in (args.protocols or ','.join(state.get('protocols', ['vless','hy2']))).split(',')))
     if not selected or any(p not in PROTOCOLS for p in selected): raise ValueError('支持的协议：vless,hy2,anytls')
@@ -412,7 +530,9 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(dir=str(ROOT)) as temp:
             archive = Path(temp)/'release.gz'
             try:
-                with urllib.request.build_opener(NoRedirect()).open(state['binary_url'],timeout=120) as source, archive.open('wb') as out:
+                auth=download_auth(args,state['binary_url'],state.get('release_manifest') or state['binary_url'])
+                req=urllib.request.Request(state['binary_url'],headers={'Authorization':auth} if auth else {})
+                with urllib.request.build_opener(NoRedirect()).open(req,timeout=120) as source, archive.open('wb') as out:
                     bounded_copy(source,out,128*1024*1024)
             except (urllib.error.URLError,OSError): raise RuntimeError('发布包下载失败') from None
             candidate=Path(temp)/'whalenode'
@@ -523,7 +643,7 @@ if __name__=='__main__':
     try:main()
     except (Exception,KeyboardInterrupt) as e:
         # Do not emit exception URLs, request bodies, credentials or stack locals.
-        print('安装未完成：'+(str(e) if isinstance(e,(RuntimeError,ValueError)) else type(e).__name__),file=sys.stderr)
+        print('操作未完成：'+(str(e) if isinstance(e,(RuntimeError,ValueError)) else type(e).__name__),file=sys.stderr)
         sys.exit(1)
 
 WHALE_INSTALLER_PY
