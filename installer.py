@@ -12,6 +12,9 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import socket
+import ssl
+import platform
 import subprocess
 import sys
 import tempfile
@@ -25,7 +28,7 @@ CONF = Path('/etc/whalenode')
 PROTOCOLS = {'vless': ('vless', 28443), 'hy2': ('hysteria', 24443), 'anytls': ('anytls', 30443)}
 
 def run(*args, check=True):
-    p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
     if check and p.returncode:
         raise RuntimeError('命令执行失败：' + args[0] + '（为保护凭据，未输出命令详情）')
     return p
@@ -49,7 +52,9 @@ def request(url, token=None, data=None):
     req = urllib.request.Request(https(url), data=None if data is None else json.dumps(data).encode(), headers=headers)
     try:
         with urllib.request.build_opener(NoRedirect()).open(req, timeout=60) as response:
-            return json.load(response)
+            raw=response.read(16*1024*1024+1)
+            if len(raw)>16*1024*1024:raise RuntimeError('API 响应超过大小限制')
+            return json.loads(raw)
     except urllib.error.HTTPError as e:
         raise RuntimeError('API 请求失败，HTTP 状态码：' + str(e.code)) from None
     except (urllib.error.URLError, ValueError):
@@ -69,6 +74,15 @@ def atomic(path, text, mode=0o600):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+def bounded_copy(source,out,limit):
+    total=0
+    while True:
+        block=source.read(1024*1024)
+        if not block:return
+        total+=len(block)
+        if total>limit:raise RuntimeError('发布包超过允许大小，已停止下载或解压')
+        out.write(block)
 
 def resources():
     cpu = len(os.sched_getaffinity(0))
@@ -99,10 +113,112 @@ def parser():
     p.add_argument('--protocols', default=None)
     p.add_argument('--group-ids')
     p.add_argument('--route-ids')
-    p.add_argument('--sni', default=None, help='已测试可用的 TLS 域名，新任务必填')
+    p.add_argument('--sni', default=None, help='可选；指定已测试可用的 TLS 域名')
     p.add_argument('--status', action='store_true')
     p.add_argument('--plan', action='store_true')
+    p.add_argument('--non-interactive', action='store_true', help='禁止交互，缺少参数时直接报错')
+    p.add_argument('--release-manifest', help='HTTPS 发布清单，自动选择架构及校验值')
+    p.add_argument('--rollback', action='store_true', help='停止本任务服务并恢复本任务修改的系统参数；保留隐藏面板节点')
     return p
+
+def prompt(text, default='', required=False):
+    try:
+        with open('/dev/tty','r',encoding='utf-8') as reader, open('/dev/tty','w',encoding='utf-8',buffering=1) as tty:
+            while True:
+                tty.write(text+(' ['+default+']' if default else '')+': ')
+                tty.flush()
+                line=reader.readline()
+                if not line: raise RuntimeError('终端输入已关闭')
+                value=line.strip() or default
+                if value or not required:return value
+                tty.write('此项不能为空。\n')
+    except OSError:
+        raise RuntimeError('没有交互终端，请通过参数提供配置或使用 SSH 终端执行') from None
+
+def manifest(url, machine=None):
+    machine=machine or platform.machine()
+    arch={'x86_64':'amd64','aarch64':'arm64'}.get(machine)
+    if not arch:raise ValueError('不支持的 CPU 架构：'+machine)
+    doc=request(url)
+    entry=doc.get('architectures',{}).get(arch)
+    if doc.get('schema')!=1 or not isinstance(entry,dict):raise ValueError('发布清单未提供当前架构：'+arch)
+    https(entry.get('url',''))
+    if not re.fullmatch('[a-f0-9]{64}',entry.get('sha256','')) or not re.fullmatch('[a-f0-9]{40}',entry.get('source_commit','')):
+        raise ValueError('发布清单的校验值或源码提交号无效')
+    return {'binary_url':entry['url'],'binary_sha256':entry['sha256'],'source_commit':entry['source_commit']}
+
+def wizard(args,state):
+    interactive=not args.non_interactive
+    for name,label in [('api_url','节点 API 的 HTTPS 地址'),('admin_url','面板管理 API 前缀（含 /api/v1/管理路径）')]:
+        if not getattr(args,name) and not state.get(name):
+            if not interactive:raise ValueError('缺少参数 --'+name.replace('_','-'))
+            setattr(args,name,prompt(label,required=True))
+    if not args.protocols and not state.get('protocols') and interactive:
+        args.protocols=prompt('选择协议，逗号多选：vless / hy2 / anytls','vless,hy2')
+    if args.name is None and not state.get('name') and interactive:
+        args.name=prompt('节点名称（直接回车自动按地区命名）') or None
+    if args.group_ids is None and not state.get('groups') and interactive:
+        args.group_ids=prompt('面板权限组 ID，逗号分隔','1')
+    if args.route_ids is None and 'routes' not in state and interactive:
+        args.route_ids=prompt('面板路由组 ID（回车不指定）')
+    release=args.release_manifest or state.get('release_manifest')
+    if not release and not (args.binary_url or state.get('binary_url')):
+        if not interactive:raise ValueError('缺少 --release-manifest 或 --binary-url')
+        release=prompt('WhaleNode HTTPS 发布清单地址（自动选择版本和校验值）',required=True)
+    if release:
+        if state.get('release_manifest') and release!=state['release_manifest'] and state.get('ids'):
+            raise ValueError('续跑不能更换已使用的发布清单')
+        if not all(state.get(k) for k in ('binary_url','binary_sha256','source_commit')):
+            state.update(manifest(release))
+        state['release_manifest']=release
+    else:
+        for name,label in [('binary_sha256','可执行文件 SHA256'),('source_commit','完整源码提交 SHA')]:
+            if not getattr(args,name) and not state.get(name) and interactive:
+                setattr(args,name,prompt(label,required=True))
+
+def choose_sni(used):
+    for host in ('www.php.net','www.oracle.com','www.microsoft.com','www.apple.com','www.cloudflare.com'):
+        if host in used:continue
+        try:
+            with socket.create_connection((host,443),timeout=5) as sock:
+                with ssl.create_default_context().wrap_socket(sock,server_hostname=host) as tls:
+                    if tls.version():return host
+        except OSError:continue
+    raise RuntimeError('自动 SNI 测试没有通过，请通过 --sni 指定已验证域名')
+
+def dependency_check():
+    if not Path('/run/systemd/system').is_dir():raise RuntimeError('需要使用 systemd 的服务器')
+    needed=('nft','ss','sysctl','modprobe','useradd','runuser')
+    if all(shutil.which(x) for x in needed):return
+    print('正在安装缺少的运行依赖…',flush=True)
+    if shutil.which('apt-get'):
+        run('apt-get','update','-qq')
+        run('env','DEBIAN_FRONTEND=noninteractive','apt-get','install','-y','--no-install-recommends','nftables','iproute2','procps','kmod','passwd','util-linux','ca-certificates')
+    elif shutil.which('dnf'):
+        run('dnf','install','-y','nftables','iproute','procps-ng','kmod','shadow-utils','util-linux','ca-certificates')
+    else:raise RuntimeError('无法安装依赖：未找到 apt-get 或 dnf')
+
+def rollback(state):
+    if not state.get('owns_service') and not state.get('owns_egress'):raise RuntimeError('本任务尚未修改服务或系统参数，无需回滚')
+    run('systemctl','disable','--now','whalenode.service',check=False)
+    run('systemctl','disable','--now','whalenode-egress.service',check=False)
+    if state.get('owns_egress'):run('nft','delete','table','inet','whalenode_egress',check=False)
+    path=ROOT/'sysctl-before.json'
+    if path.exists():
+        for key,value in json.loads(path.read_text()).items():run('sysctl','-w',key+'='+str(value))
+    for path in ['/etc/systemd/system/whalenode.service','/etc/systemd/system/whalenode-egress.service','/etc/whalenode-egress.nft','/etc/sysctl.d/90-whalenode.conf']:
+        Path(path).unlink(missing_ok=True)
+    run('systemctl','daemon-reload')
+    state['phase']='rolled_back';atomic(ROOT/'state.json',json.dumps(state,ensure_ascii=False,indent=2))
+    print('已停止本任务服务、移除本任务规则并恢复系统参数。配置和隐藏面板节点保留，便于核查及续跑。')
+
+def verify_service(state):
+    run('systemctl','is-active','--quiet','whalenode.service')
+    pid=run('systemctl','show','whalenode.service','--property=MainPID','--value').stdout.strip()
+    if not pid.isdigit() or int(pid)==0:raise RuntimeError('服务进程不存在')
+    if hashlib.sha256(Path('/proc/'+pid+'/exe').read_bytes()).hexdigest()!=state['binary_sha256']:
+        raise RuntimeError('正在运行的后端与已校验发布包不一致')
+    run('nft','list','table','inet','whalenode_egress')
 
 def rows(response):
     data = response.get('data')
@@ -120,36 +236,48 @@ def main(argv=None):
         return
     ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(ROOT / 'lock', 'w')
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:raise RuntimeError('已有安装任务正在运行，请勿同时执行；等待当前任务结束后再续跑') from None
     state_path = ROOT / 'state.json'
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if args.rollback:
+        rollback(state);return
     if args.status:
         print(json.dumps({k: state.get(k) for k in ('host','name','protocols','ids','phase','resources')}, ensure_ascii=False, indent=2))
         return
-    selected = list(dict.fromkeys((args.protocols or ','.join(state.get('protocols', ['vless','hy2']))).split(',')))
+    if state.get('phase')=='installed':
+        if run('systemctl','is-active','--quiet','whalenode.service',check=False).returncode:
+            raise RuntimeError('任务记录已安装，但服务没有运行；请检查 journalctl -u whalenode，再执行 --rollback 后续跑')
+        verify_service(state)
+        print('已安装且服务正在运行，无需重复部署。使用 --status 查看状态。');return
+    for service in ('V2bX.service','whalenode.service'):
+        if service=='whalenode.service' and state.get('owns_service'):
+            run('systemctl','stop',service,check=False)
+            continue
+        if run('systemctl','is-active','--quiet',service,check=False).returncode==0:
+            if service=='whalenode.service' and state.get('owns_service'):
+                run('systemctl','stop',service)
+            else:raise RuntimeError('发现已有后端服务，未覆盖：'+service)
+    if not state and any(Path(p).exists() for p in (str(CONF),'/etc/systemd/system/whalenode.service','/etc/systemd/system/whalenode-egress.service','/etc/sysctl.d/90-whalenode.conf','/etc/whalenode-egress.nft')):
+        raise RuntimeError('发现已有 WhaleNode 文件，请检查后再安装')
+    print('WhaleNode 中文安装向导。已有参数自动采用，密钥隐藏输入。',flush=True)
+    wizard(args,state)
+    selected = list(dict.fromkeys(x.strip().lower() for x in (args.protocols or ','.join(state.get('protocols', ['vless','hy2']))).split(',')))
     if not selected or any(p not in PROTOCOLS for p in selected): raise ValueError('支持的协议：vless,hy2,anytls')
     if state.get('protocols') and selected != state['protocols']: raise ValueError('续跑必须保留原有协议组合')
     facts = resources()
-    if args.plan:
-        print(json.dumps({'protocols': selected, 'resources': facts, 'steps': ['verify artifact and provenance','create hidden panel nodes','write backend configuration','apply bounded tuning','block service IPv6 egress','start and check listeners'], 'publication': 'hidden until external protocol acceptance and product/monitoring integration'}, ensure_ascii=False, indent=2))
-        return
-    if state.get('phase') == 'installed':
-        print('本任务已经安装完成。使用 --status 查看状态；不会重复覆盖现有配置。')
-        return
-    for service in ('V2bX.service','whalenode.service'):
-        if run('systemctl','is-active','--quiet',service,check=False).returncode == 0:
-            raise RuntimeError('检测到已有后端正在运行，未自动替换')
-    if not state and (CONF.exists() or Path('/etc/systemd/system/whalenode.service').exists()):
-        raise RuntimeError('发现已有 WhaleNode 文件，请检查后再安装')
     for name in ('api_url','admin_url','binary_url','binary_sha256','source_commit','host','name','sni'):
         value = getattr(args,name) or state.get(name)
+        if state.get('ids') and state.get(name) != value:
+            raise ValueError('已创建节点的续跑不能更改 --'+name.replace('_','-'))
         if value: state[name] = value
     for name in ('api_url','admin_url','binary_url'):
         if not state.get(name): raise ValueError('缺少必填参数 --' + name.replace('_','-'))
         https(state[name])
     if not re.fullmatch('[a-fA-F0-9]{64}',state.get('binary_sha256','')): raise ValueError('请通过 --binary-sha256 提供解压后可执行文件的 SHA256')
+    state['binary_sha256']=state['binary_sha256'].lower()
     if not re.fullmatch('[a-f0-9]{40}',state.get('source_commit','')): raise ValueError('请通过 --source-commit 提供完整的 40 位源码提交号')
-    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{1,251}[a-zA-Z0-9]',state.get('sni','')): raise ValueError('请通过 --sni 提供已测试可用的 TLS 域名')
+    if state.get('sni') and not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{1,251}[a-zA-Z0-9]',state['sni']): raise ValueError('请通过 --sni 提供已测试可用的 TLS 域名')
     if not state.get('host'):
         geo = request('https://ipwho.is/')
         if geo.get('success') is not True: raise RuntimeError('地区识别失败，请提供 --host 和 --name')
@@ -172,7 +300,14 @@ def main(argv=None):
         raise ValueError('续跑必须保留原面板权限组和路由组')
     state.update(groups=groups,routes=routes)
     def credential(value, path, prompt):
-        return value or (path.read_text().strip() if path else getpass.getpass(prompt))
+        if value:return value
+        if path:return path.read_text().strip()
+        if args.non_interactive:raise ValueError('非交互模式缺少密钥参数或凭据文件')
+        return getpass.getpass(prompt)
+    if not args.api_key and not args.api_key_file and (CONF/'config.json').exists():
+        previous=json.loads((CONF/'config.json').read_text())
+        nodes=previous.get('Nodes',[])
+        if nodes and all(n.get('ApiHost')==state['api_url'] for n in nodes):args.api_key=nodes[0].get('ApiKey')
     api_key = credential(args.api_key,args.api_key_file,'请输入节点 API 密钥（隐藏输入）：')
     admin = credential(args.admin_token,args.admin_token_file,'请输入面板管理员授权值（隐藏输入，不保存）：')
     if not api_key or not admin: raise ValueError('凭据不能为空')
@@ -183,30 +318,49 @@ def main(argv=None):
         state['phase'] = phase
         atomic(state_path,json.dumps(state,indent=2))
     save('preflight')
+    dependency_check()
     # Reject foreign listeners before downloading/configuring anything.
     for proto in selected:
         sock = '-lun' if proto=='hy2' else '-ltn'
         if len(run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines())>1:
             raise RuntimeError('所需端口已被占用，协议：'+proto)
     all_nodes = rows(request(state['admin_url']+'/server/manage/getNodes',admin))
+    state.setdefault('snis',{})
+    used={str(x.get('server_name','')) for x in all_nodes}
+    for x in all_nodes:
+        tls=x.get('tls_settings')
+        if isinstance(tls,dict):used.add(tls.get('server_name',''))
+    for proto in selected:
+        if proto not in state['snis']:
+            state['snis'][proto]=state.get('sni') or choose_sni(used)
+            used.add(state['snis'][proto]);save('preflight')
+    print('后台连接通过；正在校验后端发布包…',flush=True)
     releases = Path('/opt/whalenode/releases'); releases.mkdir(parents=True,exist_ok=True)
+    releases.parent.chmod(0o755);releases.chmod(0o755)
     binary = releases / state['binary_sha256']
     if not binary.exists():
+        if shutil.disk_usage(str(ROOT)).free<512*1024*1024:raise RuntimeError('安装分区至少需要 512 MiB 可用空间')
         with tempfile.TemporaryDirectory(dir=str(ROOT)) as temp:
             archive = Path(temp)/'release.gz'
             try:
                 with urllib.request.build_opener(NoRedirect()).open(state['binary_url'],timeout=120) as source, archive.open('wb') as out:
-                    shutil.copyfileobj(source,out)
+                    bounded_copy(source,out,128*1024*1024)
             except (urllib.error.URLError,OSError): raise RuntimeError('发布包下载失败') from None
             candidate=Path(temp)/'whalenode'
-            with gzip.open(archive,'rb') as source, candidate.open('wb') as out: shutil.copyfileobj(source,out)
+            with gzip.open(archive,'rb') as source, candidate.open('wb') as out:bounded_copy(source,out,256*1024*1024)
             if hashlib.sha256(candidate.read_bytes()).hexdigest()!=state['binary_sha256']:
                 raise RuntimeError('发布包 SHA256 校验失败')
             candidate.chmod(0o755)
             info=json.loads(run(str(candidate),'version','--json').stdout)
             if info.get('product')!='WhaleNode' or info.get('commit')!=state['source_commit'][:12] or info.get('profile')!='sing-owned':
                 raise RuntimeError('WhaleNode 产品或构建来源校验失败')
-            shutil.copyfile(candidate,binary);binary.chmod(0o755)
+            fd,staged=tempfile.mkstemp(dir=str(releases),prefix='.candidate-')
+            try:
+                with os.fdopen(fd,'wb') as out, candidate.open('rb') as source:
+                    shutil.copyfileobj(source,out);out.flush();os.fsync(out.fileno())
+                os.chmod(staged,0o755);os.replace(staged,binary)
+            finally:
+                if os.path.exists(staged):os.unlink(staged)
     if hashlib.sha256(binary.read_bytes()).hexdigest()!=state['binary_sha256']: raise RuntimeError('已下载可执行文件的 SHA256 不匹配')
     for proto in selected:
         typ,port=PROTOCOLS[proto]
@@ -218,18 +372,20 @@ def main(argv=None):
             raise RuntimeError('已有非本任务节点使用此名称，未接管或覆盖')
         if not matches:
             payload={'name':name,'host':state['host'],'port':port,'server_port':port,'group_id':groups,'route_id':routes,'rate':1,'show':0,'tags':[state['nonce']]}
-            if proto=='vless':payload.update(tls=2,network='tcp',flow='xtls-rprx-vision',tls_settings={'server_name':state['sni'],'server_port':'443'})
+            if proto=='vless':payload.update(tls=2,network='tcp',flow='xtls-rprx-vision',tls_settings={'server_name':state['snis'][proto],'server_port':'443'})
             else:
-                payload.update(server_name=state['sni'],insecure=1)
+                payload.update(server_name=state['snis'][proto],insecure=1)
                 if proto=='hy2':payload.update(version=2,obfs='salamander',obfs_password=secrets.token_hex(16),up_mbps=0,down_mbps=0)
             # A timed-out write is never retried here; next run reconciles its persisted tag.
             result=request(state['admin_url']+'/server/'+typ+'/save',admin,payload)
             if result.get('data') is not True:raise RuntimeError('面板未确认节点创建成功')
             all_nodes=rows(request(state['admin_url']+'/server/manage/getNodes',admin))
             matches=[x for x in all_nodes if x.get('type')==typ and x.get('name')==name and state['nonce'] in (x.get('tags') or [])]
-        if len(matches)!=1 or matches[0].get('host')!=state['host'] or int(matches[0].get('show',0))!=0:
+        if len(matches)!=1 or matches[0].get('host')!=state['host'] or int(matches[0].get('show',0))!=0 or state['nonce'] not in (matches[0].get('tags') or []):
             raise RuntimeError('面板节点核对失败，新建节点仍保持隐藏')
+        if int(matches[0].get('server_port',0))!=port:raise RuntimeError('面板节点端口与任务不一致，停止续跑')
         state['ids'][proto]=int(matches[0]['id']);save('panel')
+        print('面板节点已核对：'+proto+' #'+str(state['ids'][proto]),flush=True)
     del admin
     if run('id','-u','whalenode',check=False).returncode:
         run('useradd','--system','--home-dir',str(CONF),'--shell','/usr/sbin/nologin','whalenode')
@@ -238,13 +394,13 @@ def main(argv=None):
     nodes=[]
     for proto in selected:
         typ='hysteria2' if proto=='hy2' else proto
-        nodes.append({'Core':'sing','ApiHost':state['api_url'],'ApiKey':api_key,'NodeID':state['ids'][proto],'NodeType':typ,'Timeout':180,'ListenIP':'0.0.0.0','SendIP':'0.0.0.0','CertConfig':{'CertMode':'self','CertDomain':state['sni'],'CertFile':str(CONF/(proto+'.cer')),'KeyFile':str(CONF/(proto+'.key'))}})
+        nodes.append({'Core':'sing','ApiHost':state['api_url'],'ApiKey':api_key,'NodeID':state['ids'][proto],'NodeType':typ,'Timeout':180,'ListenIP':'0.0.0.0','SendIP':'0.0.0.0','CertConfig':{'CertMode':'self','CertDomain':state['snis'][proto],'CertFile':str(CONF/(proto+'.cer')),'KeyFile':str(CONF/(proto+'.key'))}})
     config={'Log':{'Level':'warn','Output':''},'Cores':[{'Type':'sing','Log':{'Level':'warn'},'OriginalPath':str(CONF/'sing_original.json')}],'Nodes':nodes}
     atomic(CONF/'config.json',json.dumps(config))
     atomic(CONF/'sing_original.json',json.dumps({'route':{'rules':[]}}))
     run('chown','-R','whalenode:whalenode',str(CONF));CONF.chmod(0o700)
     # Own only this table. IPv6 management and other services are unaffected.
-    table='table inet whalenode_egress { chain output { type filter hook output priority 0; policy accept; meta skuid '+str(uid)+' meta nfproto ipv6 counter reject; } }\n'
+    table='table inet whalenode_egress {\n chain output {\n  type filter hook output priority 0; policy accept;\n  meta skuid '+str(uid)+' meta nfproto ipv6 counter reject\n }\n}\n'
     nft=Path('/etc/whalenode-egress.nft')
     exists=run('nft','list','table','inet','whalenode_egress',check=False).returncode==0
     if exists and not state.get('owns_egress'):
@@ -254,7 +410,7 @@ def main(argv=None):
         run('nft','--check','-f',str(nft))
         state['owns_egress']=True;save('egress')
         run('nft','-f',str(nft))
-    atomic('/etc/systemd/system/whalenode-egress.service','[Unit]\nBefore=whalenode.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/whalenode-egress.nft\n[Install]\nWantedBy=multi-user.target\n',0o644)
+    atomic('/etc/systemd/system/whalenode-egress.service','[Unit]\nBefore=whalenode.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/whalenode-egress.nft\nExecStop=/usr/sbin/nft delete table inet whalenode_egress\n[Install]\nWantedBy=multi-user.target\n',0o644)
     # Conservative, resource-bounded settings; never rewrite driver IRQ or offload blindly.
     settings={'net.core.somaxconn':8192,'net.core.rmem_max':facts['socket_buffer'],'net.core.wmem_max':facts['socket_buffer'],'net.ipv4.tcp_mtu_probing':1}
     old=json.loads((ROOT/'sysctl-before.json').read_text()) if (ROOT/'sysctl-before.json').exists() else {}
@@ -271,19 +427,26 @@ def main(argv=None):
     run('sysctl','-p','/etc/sysctl.d/90-whalenode.conf')
     unit='[Unit]\nDescription=WhaleNode\nAfter=network-online.target whalenode-egress.service\nRequires=whalenode-egress.service\nWants=network-online.target\n[Service]\nUser=whalenode\nGroup=whalenode\nWorkingDirectory='+str(CONF)+'\nUMask=0077\nEnvironment=GOMEMLIMIT='+str(facts['go_memory_mib'])+'MiB\nEnvironment=GOMAXPROCS='+str(facts['cpus'])+'\nExecStart='+str(binary)+' server -c '+str(CONF/'config.json')+'\nRestart=always\nRestartSec=5\nLimitNOFILE=262144\nNoNewPrivileges=true\nProtectHome=true\nProtectSystem=strict\nReadWritePaths='+str(CONF)+'\n[Install]\nWantedBy=multi-user.target\n'
     atomic('/etc/systemd/system/whalenode.service',unit,0o644)
+    state['owns_service']=True;save('configured')
     run('systemctl','daemon-reload')
     # Table already loaded; mark oneshot active without loading it a second time.
-    run('nft','delete','table','inet','whalenode_egress')
+    run('systemctl','stop','whalenode-egress.service',check=False)
+    run('nft','delete','table','inet','whalenode_egress',check=False)
     run('systemctl','enable','--now','whalenode-egress.service')
     save('starting')
     run('systemctl','enable','--now','whalenode.service')
-    time.sleep(10)
-    run('systemctl','is-active','--quiet','whalenode.service')
-    missing=[]
-    for proto in selected:
-        sock='-lun' if proto=='hy2' else '-ltn'
-        if len(run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines())<2:missing.append(proto)
-    if missing:raise RuntimeError('后端监听未就绪，协议：'+','.join(missing))
+    missing=selected[:]
+    for _ in range(36):
+        missing=[]
+        for proto in selected:
+            sock='-lun' if proto=='hy2' else '-ltn'
+            if len(run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines())<2:missing.append(proto)
+        if not missing:break
+        time.sleep(5)
+    if missing:
+        run('systemctl','stop','whalenode.service',check=False)
+        raise RuntimeError('后端监听未就绪，已停止失败服务，协议：'+','.join(missing)+'；使用 journalctl -u whalenode 检查后可原命令续跑')
+    verify_service(state)
     save('installed')
     print('本机安装完成，面板节点仍保持隐藏。还需完成公网 TCP/UDP 协议测试、产品分组及监控验收；请核实入站防火墙规则。')
 

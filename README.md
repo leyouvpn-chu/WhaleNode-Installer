@@ -1,0 +1,153 @@
+# WhaleNode 一键安装器
+
+在 Linux 新服务器的 SSH 终端执行，进入中文安装向导。默认创建 **VLESS（REALITY）+ Hysteria2**，也可选择 AnyTLS。脚本公开；后台地址、密钥和后端制品由运营方在安装时提供，不内置在仓库中。
+
+## 新服务器怎么执行
+
+以 root 登录，用下面这一整行启动安装，**不要追加 `--help`**：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.2.0/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
+```
+
+下载地址不能直接作为 shell 命令执行。下载和执行必须使用同一个文件名。`--help` 只显示帮助，不会安装。
+
+如果系统没有 curl，Debian/Ubuntu 先执行 `apt-get update && apt-get install -y curl ca-certificates`；CentOS Stream/Rocky/AlmaLinux 使用 `dnf install -y curl ca-certificates`。建议通过 SSH 或网页 XTerm.js 操作；传统 NoVNC 文本控制台可能无法显示中文字形。
+
+### 第一次需要填写什么
+
+| 顺序 | 内容 | 说明 |
+| --- | --- | --- |
+| 1 | 节点 API 的 HTTPS 地址 | 节点连接面板的地址 |
+| 2 | 面板管理 API 前缀 | 包含 `/api/v1/实际管理路径`，不是管理网页地址 |
+| 3 | 协议 | 回车选择 `vless,hy2`；多选示例 `vless,hy2,anytls` |
+| 4 | 节点名称 | 回车按公网 IPv4 的国家、城市生成；也可自行命名 |
+| 5 | 面板权限组 ID | 默认 `1`；必须确认实际存在并符合产品权限 |
+| 6 | 面板路由组 ID | 回车不指定；可填逗号分隔 ID |
+| 7 | WhaleNode 发布清单 HTTPS 地址 | 运营方提供，包含当前架构的下载地址、哈希和源码版本 |
+| 8 | 节点 API 密钥 | 隐藏输入；不是管理员令牌 |
+| 9 | 面板管理员授权值 | 隐藏输入；只用于本次创建和核对节点，不保存 |
+
+管理 API 前缀和授权值应由面板管理员提供。授权值与面板请求的 `Authorization` 内容一致，安装器不会自行添加 `Bearer`。节点 API Key 没有创建节点权限，不能代替管理员授权。
+
+安装器读取机器资源 → 核对面板 → 校验 WhaleNode 制品 → 创建隐藏节点 → 安装服务及出口规则 → 检查运行文件哈希和协议监听。失败会说明原因，可以修复后运行原命令续跑。
+
+**安装完成后节点仍为隐藏状态。** 运营方需放行入站端口、完成外部客户端协议测试，确认权限组与监控接入后再在面板发布。此脚本不会把本机监听成功等同于伊朗、俄罗斯或其他用户网络可用。
+
+## 参数与记忆
+
+可以直接带非敏感参数，其余内容由向导询问：
+
+```bash
+bash /root/whalenode-install.sh \
+  --api-url 'https://panel.example.com' \
+  --admin-url 'https://panel.example.com/api/v1/ADMIN_PATH' \
+  --release-manifest 'https://downloads.example.com/private/manifest.json' \
+  --name '自定义名称' --protocols vless,hy2,anytls --group-ids 1
+```
+
+以上域名和管理路径是占位符，必须换成运营方提供的值。
+
+| 操作 | 命令 |
+| --- | --- |
+| 查看帮助 | `bash /root/whalenode-install.sh --help` |
+| 只看资源和计划 | `bash /root/whalenode-install.sh --plan` |
+| 查看任务进度 | `bash /root/whalenode-install.sh --status` |
+| 失败后续跑 | `bash /root/whalenode-install.sh` |
+| 回滚本任务本机变更 | `bash /root/whalenode-install.sh --rollback` |
+
+配置与节点 ID 保存在 `/var/lib/whalenode-installer/state.json`，目录权限 0700、文件 0600。名称、协议、面板地址、下载版本、组和路由会记忆，已创建节点不会因正常续跑重复创建。已完成任务再次运行会核验正在运行的文件和出口规则，不重复安装。
+
+管理员令牌不保存：未完成任务续跑时需要重新提供。节点 API Key 在后端配置生成后可从本机配置复用；更早的失败需要再次提供。记忆只在当前服务器生效，不会自动同步到其他新服务器。不要复制旧任务状态来部署新机器。
+
+自动化可以使用 `--non-interactive`，缺参数直接失败；用 `--api-key-file /root/node-key` 和 `--admin-token-file /root/admin-token` 从权限 0600 的文件读取密钥。也支持 `--api-key`、`--admin-token`，但直接写在命令行可能进入历史和进程参数，优先使用隐藏输入或凭据文件。不要使用 `bash -x`。
+
+其他参数：`--host IPv4` 指定入口 IP；`--sni 域名` 指定已测试的 TLS 域名。默认自动测试候选 SNI 并避开面板中已使用的候选。候选不足会停止，不自动复用。`--binary-url`、`--binary-sha256`、`--source-commit` 可代替发布清单。
+
+## 后端下载与安全边界
+
+仓库不提供 WhaleNode 后端二进制，也不包含运营方 API 地址或密钥。公开脚本本身不需要密码；**访问后端制品的权限由运营方下载服务控制**。支持 HTTPS 私有/签名下载 URL；本版本不提供 GitHub 私库登录或自建下载鉴权服务。
+
+清单和制品 URL 保存在 root 专属任务状态中，不应使用公开永久链接承载需要保密的二进制。签名 URL 需要覆盖安装/续跑所需时间。清单与制品下载都禁止重定向，请提供最终 HTTPS 地址。下载服务如果要求专用鉴权请求头，需要先提供兼容的签名 URL。
+
+示例清单（值均为占位符）：
+
+```json
+{
+  "schema": 1,
+  "architectures": {
+    "amd64": {
+      "url": "https://downloads.example.com/private/whalenode.gz",
+      "sha256": "解压后可执行文件的64位小写SHA256",
+      "source_commit": "40位小写源码提交SHA"
+    }
+  }
+}
+```
+
+`arm64` 使用同样结构。清单按当前架构选择制品；续跑使用已记录的版本，不随远程清单更新自动升级。运营方可用以下工具生成清单，再上传至自己的 HTTPS 下载服务：
+
+```bash
+python3 make_manifest.py --archive whalenode.gz \
+  --url 'https://downloads.example.com/private/whalenode.gz' \
+  --source-commit '实际40位源码提交SHA' --arch amd64 > manifest.json
+```
+
+哈希必须是**解压后的可执行文件**，不是 gzip 文件。下载后核对哈希、`version --json` 中的 WhaleNode 产品名、源码提交和 `sing-owned` 构建配置。哈希验证依赖可信清单，不能替代独立的发行签名。不会回退安装 V2bX。
+
+节点密钥保存在 `/etc/whalenode/config.json`，权限 0600，WhaleNode 专用服务用户可读；配置目录权限 0700。管理员令牌不写入状态或后端配置。获得服务器 root 权限的人仍能读取节点密钥，公开脚本不能消除这一权限边界。
+
+## 系统与调优
+
+需 root、systemd、至少 768 MiB 可用配额内存，以及 512 MiB 安装磁盘空间。发行版入口允许 Debian 11+、Ubuntu 22+、CentOS Stream/Rocky/AlmaLinux/RHEL 9+；不支持 CentOS 7/8、Alpine 或无 systemd 容器。架构支持 x86_64/aarch64，但实际可安装性取决于运营方提供相应后端制品。
+
+- 根据 CPU affinity 和 cgroup 配额设置 `GOMAXPROCS`。
+- 根据主机/cgroup 内存上限设置 `GOMEMLIMIT` 和有界 socket 缓冲区。
+- 检测内核支持后启用 BBR/fq，调整连接队列和 TCP MTU 探测。
+- 使用非 root 服务用户和 systemd 文件访问限制，开机自动启动。
+- 通过独立 nftables 表阻断 **WhaleNode 用户的 IPv6 出口**，保留主机 IPv6 管理及其他服务。
+- 记录修改前的 sysctl；不盲目修改网卡 IRQ、RPS、offload 或强制绑定 CPU，不承诺静态参数在所有线路都达到最佳性能。
+
+| 协议 | 必须放行的默认入站端口 |
+| --- | --- |
+| VLESS + REALITY | TCP 28443 |
+| Hysteria2 | UDP 24443 |
+| AnyTLS | TCP 30443 |
+
+脚本不改云安全组或主机入站防火墙。HY2/AnyTLS 当前使用自签证书及面板 `insecure=1`，客户端应匹配这套配置。
+
+## 故障与回滚
+
+```bash
+systemctl status whalenode whalenode-egress --no-pager
+journalctl -u whalenode -n 80 --no-pager
+bash /root/whalenode-install.sh --status
+```
+
+分享日志前先遮盖后台地址和敏感字段。常见原因包括管理员权限/管理路径错误、下载链接过期、制品哈希错误、端口已被其他服务占用、候选 SNI 不可达。
+
+脚本拒绝接管未知配置和现有代理服务。面板写请求遇到超时不会立即重复提交，下次按持久任务标签核对记录。不要通过删除状态文件“重试”，否则会丢失关联和回滚依据。
+
+`--rollback` 停止并禁用本任务服务，移除本任务 nftables 表和配置文件、恢复记录的 sysctl。它会中断该节点流量；保留本机密钥配置、任务状态、已下载制品和隐藏面板行，以便续跑。不是彻底卸载，也不会删除其他业务或面板节点。
+
+## 兼容与验收范围
+
+面板需兼容 `server/manage/getNodes` 和 `server/{vless,hysteria,anytls}/save` 管理接口，以及 WhaleNode 使用的节点接口。不同 V2Board 分支不保证兼容。
+
+安装器负责本机后端、面板隐藏节点和有界调优。Grafana/Zabbix 注册、各产品订阅发布和目标国家网络验收依赖运营方现有运维系统，不内置私有监控凭据，也不会自动完成这些步骤。
+
+## 实测记录
+
+见 [安装与协议验收记录](TESTING.md)。只把实际测试过的系统、架构和网络范围列为已验证，不将发行版兼容入口当作测试结果。
+
+## 开发检查
+
+无需 pip 依赖或 Go/npm 编译。修改 Python 源码后需重新生成单文件入口：
+
+```bash
+python3 build_bootstrap.py
+python3 -m unittest -v test_installer
+bash -n install.sh
+```
+
+完整安装验收应在隔离的 systemd 虚拟机上进行，使用测试面板数据及真实后端验证协议流量，不能仅靠单元测试或端口监听报告上线成功。

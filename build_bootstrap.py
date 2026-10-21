@@ -5,19 +5,21 @@ prefix='''#!/usr/bin/env bash
 set -euo pipefail
 set +x
 umask 077
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'HELP'
 WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
 
 当前显示的是使用帮助，尚未安装或修改节点。
 
-首次安装必填参数：
+首次安装可直接不带参数运行，按中文向导填写；也可用以下参数跳过对应输入：
   --api-url 地址          节点连接后台的 HTTPS 地址
   --admin-url 地址        面板管理 API 前缀（包含 /api/v1/管理路径）
-  --binary-url 地址       WhaleNode 的 gzip 发布包下载地址
+  --release-manifest 地址 发布清单，自动选择当前架构、下载地址和校验值
+  --binary-url 地址       手动指定 gzip 发布包（与下面两项配套）
   --binary-sha256 校验值  解压后可执行文件的 SHA256
   --source-commit 提交号  发布包对应的完整 40 位源码提交号
-  --sni 域名              已测试可用的 TLS 域名
+  --sni 域名              可选；默认从未复用候选域名中测试选择
 
 敏感参数（省略后隐藏输入，不在终端显示）：
   --api-key 密钥          节点 API 密钥
@@ -33,11 +35,13 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --route-ids 5,11,12     面板路由组 ID，需核实后台实际配置
   --plan                 只查看资源与计划，不安装（需已有 Python 3.9+）
   --status               查看已保存的任务进度
+  --rollback             停止本任务服务，恢复本任务修改的系统参数
+  --non-interactive      禁止询问，缺参数直接报错
   --help                 显示本帮助
 
 注意：节点 API 密钥不等于管理员授权值，自动建节点需要两者。
 安装后节点保持隐藏，公网 TCP/UDP 协议测试、产品分组和监控验收完成后再发布。
-当前不是完整的逐项输入向导，非敏感必填项仍需通过命令参数提供。
+第一次运行填写后台信息及发布清单；已有任务保留参数，失败后可以续跑。
 HELP
   exit 0
 fi
@@ -54,13 +58,14 @@ read_only=false
 for arg in "$@"; do
   [[ "$arg" != "--plan" && "$arg" != "--status" ]] || read_only=true
 done
-if [[ "$read_only" == false ]]; then
-  [[ -d /run/systemd/system ]] || { echo '需要使用 systemd 的服务器' >&2; exit 1; }
+if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>/dev/null; then
+  [[ "$read_only" == false ]] || { echo '只读操作需要已有 Python 3.9+' >&2; exit 1; }
+  echo '正在准备 Python 运行环境…'
   if command -v apt-get >/dev/null; then
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 ca-certificates nftables iproute2 procps kmod passwd
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 ca-certificates
   else
-    dnf install -y python3 ca-certificates nftables iproute procps-ng kmod shadow-utils
+    dnf install -y python3 ca-certificates
   fi
 fi
 python3 -c 'import sys; assert sys.version_info >= (3,9), "需要 Python 3.9 或更新版本"'
