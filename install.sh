@@ -141,6 +141,16 @@ def request(url, token=None, data=None):
     except (urllib.error.URLError, ValueError):
         raise RuntimeError('API 请求失败或返回内容不是有效 JSON') from None
 
+def ipv4_request(url):
+    """双栈机器默认走 IPv6，查到的是 IPv6 出口；入口必须是公网 IPv4，所以只用 IPv4 连接。"""
+    original=socket.getaddrinfo
+    def only_v4(host,port,family=0,*rest,**kw):
+        return original(host,port,socket.AF_INET,*rest,**kw)
+    socket.getaddrinfo=only_v4
+    try:return request(url)
+    except RuntimeError:raise RuntimeError('无法通过 IPv4 识别公网地址；本机需要公网 IPv4，或用 --host 指定') from None
+    finally:socket.getaddrinfo=original
+
 def atomic(path, text, mode=0o600):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -654,13 +664,13 @@ def main(argv=None):
     if not re.fullmatch('[a-f0-9]{40}',state.get('source_commit','')): raise ValueError('请通过 --source-commit 提供完整的 40 位源码提交号')
     if state.get('sni') and not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{1,251}[a-zA-Z0-9]',state['sni']): raise ValueError('请通过 --sni 提供已测试可用的 TLS 域名')
     if not state.get('host'):
-        geo = request('https://ipwho.is/')
+        geo = ipv4_request('https://ipwho.is/')
         if geo.get('success') is not True: raise RuntimeError('地区识别失败，请提供 --host 和 --name')
         state['host'] = str(ipaddress.IPv4Address(geo['ip']))
         state.setdefault('name', str(geo['country_code']) + ' ' + str(geo['city']) + ' ' + state['host'])
     state['host'] = str(ipaddress.IPv4Address(state['host']))
     if not state.get('name'):
-        geo = request('https://ipwho.is/' + state['host'])
+        geo = ipv4_request('https://ipwho.is/' + state['host'])
         if geo.get('success') is not True: raise RuntimeError('地区识别失败，请提供 --name')
         state['name'] = str(geo['country_code']) + ' ' + str(geo['city']) + ' ' + state['host']
     if len(state['name']) > 80 or any(ord(c)<32 for c in state['name']): raise ValueError('节点名称无效')

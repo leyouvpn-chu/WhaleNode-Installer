@@ -179,6 +179,16 @@ class DownloadAuthTests(unittest.TestCase):
         request.assert_called_once_with('https://files.test/manifest','Bearer download')
 
 class BootstrapTests(unittest.TestCase):
+    def test_public_address_lookup_forces_ipv4(self):
+        seen=[]
+        def fake_request(url,token=None,data=None):
+            seen.append(i.socket.getaddrinfo('example.test',443))
+            return {'success':True,'ip':'203.0.113.7'}
+        def fake_gai(host,port,family=0,*a,**k):
+            return family
+        with patch.object(i.socket,'getaddrinfo',side_effect=fake_gai),patch.object(i,'request',side_effect=fake_request):
+            self.assertEqual(i.ipv4_request('https://ipwho.is/')['ip'],'203.0.113.7')
+        self.assertEqual(seen,[i.socket.AF_INET])
     def test_install_sh_embeds_current_installer(self):
         # v0.3.0 shipped a stale install.sh: run build_bootstrap.py after editing installer.py.
         root=Path(i.__file__).resolve().parent
