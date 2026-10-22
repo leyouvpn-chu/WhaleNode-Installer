@@ -121,11 +121,19 @@ def parser():
     mode.add_argument('--check', action='store_true', help='只读检查运行文件、监听、配置权限及 IPv6 出口规则')
     p.add_argument('--report-file', type=Path, help='配合 --check 输出不含凭据的 JSON 验收报告')
     p.add_argument('--download-token-file', type=Path, help='私有下载 Bearer 令牌文件，仅本次使用')
+    p.add_argument('--download-token', help='私有下载 Bearer 令牌（会进入命令历史；优先用文件或隐藏输入）')
     p.add_argument('--download-token-prompt', action='store_true', help='隐藏输入私有下载 Bearer 令牌')
     mode.add_argument('--plan', action='store_true')
     p.add_argument('--non-interactive', action='store_true', help='禁止交互，缺少参数时直接报错')
     p.add_argument('--release-manifest', help='HTTPS 发布清单，自动选择架构及校验值')
     mode.add_argument('--rollback', action='store_true', help='停止本任务服务并恢复本任务修改的系统参数；保留隐藏面板节点')
+    mode.add_argument('--hide', action='store_true', help='面板隐藏本机节点（用户不再收到）')
+    mode.add_argument('--show', action='store_true', help='面板重新显示本机节点')
+    mode.add_argument('--uninstall', action='store_true', help='隐藏并删除面板节点，卸载本机服务和监控')
+    p.add_argument('--yes', action='store_true', help='卸载时不再确认')
+    p.add_argument('--publish', action=argparse.BooleanOptionalAction, default=None,
+                   help='安装后直接在面板显示（默认开启；--no-publish 保持隐藏）')
+    p.add_argument('--node-group', help='网关节点分组，默认 legacy_all')
     return p
 
 def prompt(text, default='', required=False):
@@ -154,11 +162,11 @@ def download_auth(args, url, allowed_origin):
     return 'Bearer '+token
 
 def prepare_download_auth(args):
-    if args.download_token_file and args.download_token_prompt:
-        raise ValueError('下载令牌文件和隐藏输入不能同时使用')
+    if sum(map(bool,(args.download_token,args.download_token_file,args.download_token_prompt)))>1:
+        raise ValueError('下载令牌只能用一种方式提供')
     if args.download_token_prompt and args.non_interactive:
         raise ValueError('非交互模式请使用 --download-token-file')
-    token=None
+    token=args.download_token
     if args.download_token_file:
         fd=os.open(args.download_token_file,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
         with os.fdopen(fd) as f:
@@ -182,7 +190,16 @@ def manifest(url, machine=None, token=None):
     https(entry.get('url',''))
     if not re.fullmatch('[a-f0-9]{64}',entry.get('sha256','')) or not re.fullmatch('[a-f0-9]{40}',entry.get('source_commit','')):
         raise ValueError('发布清单的校验值或源码提交号无效')
-    return {'binary_url':entry['url'],'binary_sha256':entry['sha256'],'source_commit':entry['source_commit']}
+    out={'binary_url':entry['url'],'binary_sha256':entry['sha256'],'source_commit':entry['source_commit']}
+    out.update(monitor_entry(doc))
+    return out
+
+def monitor_entry(doc):
+    mon=doc.get('monitor')
+    if not isinstance(mon,dict):return {}
+    https(mon.get('url',''))
+    if not re.fullmatch('[a-f0-9]{64}',mon.get('sha256','')):raise ValueError('发布清单的监控接入包校验值无效')
+    return {'monitor_url':mon['url'],'monitor_sha256':mon['sha256']}
 
 def wizard(args,state):
     interactive=not args.non_interactive
@@ -325,6 +342,159 @@ def rows(response):
     if not isinstance(data, list): raise RuntimeError('V2Board getNodes 响应格式不兼容')
     return data
 
+MARK='wn-installer'
+
+def save_state(state,phase=None):
+    if phase:state['phase']=phase
+    atomic(ROOT/'state.json',json.dumps(state,indent=2))
+
+def secret(args,value,path,label):
+    if value:return value
+    if path:return path.read_text().strip()
+    if args.non_interactive:raise ValueError('非交互模式缺少密钥参数或凭据文件')
+    return getpass.getpass(label)
+
+def admin_token(args):
+    token=secret(args,args.admin_token,args.admin_token_file,'请输入面板管理员授权值（隐藏输入，不保存）：')
+    if not token:raise ValueError('面板管理员授权值不能为空')
+    return token
+
+def ours(state,admin):
+    # (type,id) 才唯一：不同协议表的 ID 会重复。
+    return {(x.get('type'),int(x['id'])):x for x in rows(request(state['admin_url']+'/server/manage/getNodes',admin))
+            if state.get('nonce') in (x.get('tags') or [])}
+
+def set_show(state,admin,value):
+    for proto,nid in state.get('ids',{}).items():
+        result=request(state['admin_url']+'/server/'+PROTOCOLS[proto][0]+'/update',admin,{'id':nid,'show':value})
+        if result.get('data') is not True:raise RuntimeError('面板未确认显示状态修改：'+proto)
+    current=ours(state,admin)
+    for proto,nid in state.get('ids',{}).items():
+        row=current.get((PROTOCOLS[proto][0],nid))
+        if not row or int(row.get('show',0))!=value:raise RuntimeError('面板显示状态核对失败：'+proto)
+    state['published']=bool(value);save_state(state)
+
+def install_monitor(args,state):
+    """Zabbix agent2（PSK 自动注册）+ fleet 采集脚本；接入包来自私有下载并校验哈希。"""
+    if not state.get('monitor_url') and state.get('release_manifest'):
+        auth=download_auth(args,state['release_manifest'],state['release_manifest'])
+        state.update(monitor_entry(request(state['release_manifest'],auth)))
+    if not state.get('monitor_url'):raise RuntimeError('发布清单没有提供监控接入包，无法自动接入 Zabbix/Grafana')
+    name='AUTO-'+state['nonce'].upper()
+    if 'owns_agent' not in state:
+        state['owns_agent']=shutil.which('zabbix_agent2') is None;save_state(state)
+    auth=download_auth(args,state['monitor_url'],state.get('release_manifest') or state['monitor_url'])
+    req=urllib.request.Request(state['monitor_url'],headers={'Authorization':auth} if auth else {})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(req,timeout=60) as source:
+            body=source.read(4*1024*1024+1)
+    except (urllib.error.URLError,OSError):raise RuntimeError('监控接入包下载失败') from None
+    if len(body)>4*1024*1024 or hashlib.sha256(body).hexdigest()!=state['monitor_sha256']:
+        raise RuntimeError('监控接入包 SHA256 校验失败')
+    print('正在安装 Zabbix 监控（'+name+'）…',flush=True)
+    fd,path=tempfile.mkstemp(dir=str(ROOT),prefix='.monitor-')
+    try:
+        with os.fdopen(fd,'wb') as f:f.write(body)
+        # 接入包含自动注册 PSK：不回显其输出，只取结果行。
+        p=subprocess.run(['bash',path,name,'whale:landing:auto_'+state['nonce']],text=True,
+                         stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=900)
+    finally:
+        os.unlink(path)
+    if p.returncode or 'MONITOR_READY' not in p.stdout:
+        hint=[x for x in p.stdout.splitlines() if x.startswith(('UNSUPPORTED_RELEASE','DOWNLOAD_FAILED','SHA_MISMATCH','RESULT','dpkg failed'))]
+        raise RuntimeError('Zabbix 监控安装失败'+('：'+hint[-1][:160] if hint else '')+'；修复后重新运行原命令续跑')
+    state['monitor']=name;save_state(state)
+
+def wait_sync(state,admin,timeout=600):
+    """源站对账（每分钟）完成 node_ops、节点分组、监控清单后会给面板行打 wn-synced。"""
+    print('等待源站自动接入调度、节点分组和监控（通常 1–3 分钟）…',flush=True)
+    deadline=time.time()+timeout;last=None
+    while time.time()<deadline:
+        current=ours(state,admin)
+        tags=[t for row in current.values() for t in (row.get('tags') or [])]
+        if current and all('wn-synced' in (row.get('tags') or []) for row in current.values()):
+            print('源站接入完成：已登记调度、加入节点分组、监控已上线，用户订阅可以拿到这台节点。');return True
+        errors=sorted({t[9:] for t in tags if t.startswith('wn-error:')})
+        if errors and errors!=last:
+            print('源站正在重试：'+'、'.join(errors)+'（会自动继续）',flush=True);last=errors
+        time.sleep(15)
+    print('源站 10 分钟内未确认接入完成。节点已在面板显示；源站会继续自动重试，可稍后用 --status 查看。')
+    return False
+
+def ssh_port():
+    out=run('ss','-ltnpH',check=False).stdout
+    for line in out.splitlines():
+        if '"sshd"' in line:
+            port=line.split()[3].rsplit(':',1)[-1]
+            if port.isdigit():return int(port)
+    return 22
+
+def remove_monitor(state):
+    if not state.get('monitor'):return
+    run('systemctl','disable','--now','whale-conntrack-proto.timer',check=False)
+    for path in ('/etc/systemd/system/whale-conntrack-proto.service','/etc/systemd/system/whale-conntrack-proto.timer',
+                 '/usr/local/sbin/whale-conntrack-proto','/etc/zabbix/whale-stack.sh','/etc/zabbix/whale.psk',
+                 '/etc/zabbix/zabbix_agent2.d/plugins.d/whale-inventory.conf'):
+        Path(path).unlink(missing_ok=True)
+    if state.get('owns_agent'):
+        run('systemctl','disable','--now','zabbix-agent2',check=False)
+        if shutil.which('apt-get'):run('env','DEBIAN_FRONTEND=noninteractive','apt-get','purge','-y','-qq','zabbix-agent2',check=False)
+        elif shutil.which('dnf'):run('dnf','remove','-y','zabbix-agent2',check=False)
+    else:
+        run('systemctl','restart','zabbix-agent2',check=False)
+
+def uninstall(args,state):
+    if not state.get('ids') and not state.get('owns_service'):raise RuntimeError('本机没有安装器任务，无需卸载')
+    if not args.yes:
+        if args.non_interactive:raise ValueError('非交互卸载需要 --yes 确认')
+        if prompt('将隐藏并删除面板节点、卸载 WhaleNode 和监控。输入 yes 确认')!='yes':
+            print('已取消，未做任何修改。');return
+    admin=admin_token(args) if state.get('ids') else None
+    if admin and state.get('published'):
+        set_show(state,admin,0);print('面板已隐藏。',flush=True)
+    run('systemctl','disable','--now','whalenode.service',check=False)
+    run('systemctl','disable','--now','whalenode-egress.service',check=False)
+    if admin:
+        # 先停本机后端再删面板行：仍在拉配置的后端遇到被删的 NodeID 会报错重启。
+        current=ours(state,admin)
+        for proto,nid in state['ids'].items():
+            if (PROTOCOLS[proto][0],nid) in current:
+                result=request(state['admin_url']+'/server/'+PROTOCOLS[proto][0]+'/drop',admin,{'id':nid})
+                if result.get('data') is not True:raise RuntimeError('面板未确认删除节点：'+proto)
+        if ours(state,admin):raise RuntimeError('面板仍有本任务节点，卸载停止；本机服务已停止，可重新运行续做')
+        print('面板节点已删除；源站会在 1–2 分钟内自动删除监控和调度登记。',flush=True)
+    if state.get('owns_egress'):run('nft','delete','table','inet','whalenode_egress',check=False)
+    path=ROOT/'sysctl-before.json'
+    if path.exists():
+        for key,value in json.loads(path.read_text()).items():run('sysctl','-w',key+'='+str(value),check=False)
+    for item in ['/etc/systemd/system/whalenode.service','/etc/systemd/system/whalenode-egress.service','/etc/whalenode-egress.nft','/etc/sysctl.d/90-whalenode.conf']:
+        Path(item).unlink(missing_ok=True)
+    remove_monitor(state)
+    run('systemctl','daemon-reload',check=False)
+    shutil.rmtree(str(CONF),ignore_errors=True)
+    shutil.rmtree('/opt/whalenode',ignore_errors=True)
+    run('userdel','whalenode',check=False)
+    shutil.rmtree(str(ROOT),ignore_errors=True)
+    print('卸载完成：WhaleNode、出口规则、系统参数、Zabbix 监控和面板节点均已移除。')
+
+def summary(state):
+    shown='面板显示中' if state.get('published') else '面板已隐藏'
+    return '已安装 · '+shown+' · 节点 '+', '.join(p+'#'+str(n) for p,n in state.get('ids',{}).items())+(' · 监控 '+state['monitor'] if state.get('monitor') else '')
+
+def manage(args,state):
+    if args.uninstall:return uninstall(args,state)
+    if args.hide or args.show:
+        if not state.get('ids'):raise RuntimeError('本机没有已创建的面板节点')
+        set_show(state,admin_token(args),1 if args.show else 0)
+        print('面板已'+('显示' if args.show else '隐藏')+'：'+summary(state));return
+    print(summary(state))
+    choice=prompt('选择操作：1 本机自检  2 面板隐藏  3 面板重新显示  4 卸载  0 退出','0')
+    if choice=='1':
+        for item in diagnose(state)['checks']:print(('通过' if item['passed'] else '失败')+'：'+item['label'])
+    elif choice in ('2','3'):
+        set_show(state,admin_token(args),1 if choice=='3' else 0);print('完成：'+summary(state))
+    elif choice=='4':uninstall(args,state)
+
 def main(argv=None):
     args = parser().parse_args(argv)
     if os.geteuid() != 0: raise RuntimeError('请使用 root 或 sudo 运行')
@@ -333,14 +503,14 @@ def main(argv=None):
     if args.plan:
         selected = (args.protocols or 'vless,hy2').split(',')
         if any(p not in PROTOCOLS for p in selected): raise ValueError('支持的协议：vless,hy2,anytls')
-        print(json.dumps({'protocols': selected, 'resources': resources(), 'publication': '保持隐藏，等待公网协议测试、产品分组和监控验收'}, ensure_ascii=False, indent=2))
+        print(json.dumps({'protocols': selected, 'resources': resources(), 'publication': '默认安装后直接在面板显示，源站自动接入调度、节点分组和监控；--no-publish 保持隐藏'}, ensure_ascii=False, indent=2))
         return
     if args.status or args.check:
         if args.status and args.check:raise ValueError('--status 和 --check 只能选择一个')
         state_path=ROOT/'state.json'
         state=json.loads(state_path.read_text()) if state_path.exists() else {}
         if args.status:
-            print(json.dumps({k:state.get(k) for k in ('host','name','protocols','ids','phase','resources')},ensure_ascii=False,indent=2))
+            print(json.dumps({k:state.get(k) for k in ('host','name','protocols','ids','phase','published','monitor','node_group','resources')},ensure_ascii=False,indent=2))
             return
         report=diagnose(state)
         if args.report_file:
@@ -358,11 +528,23 @@ def main(argv=None):
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     if args.rollback:
         rollback(state);return
-    if state.get('phase')=='installed':
+    if args.hide or args.show or args.uninstall:
+        manage(args,state);return
+    if state.get('phase') in ('installed','published'):
         if run('systemctl','is-active','--quiet','whalenode.service',check=False).returncode:
             raise RuntimeError('任务记录已安装，但服务没有运行；请检查 journalctl -u whalenode，再执行 --rollback 后续跑')
         verify_service(state)
-        print('已安装且服务正在运行，无需重复部署。使用 --status 查看状态。');return
+        if args.publish is not None:state['publish']=args.publish
+        if state.get('monitor') and (state.get('published') or not state.get('publish',True)):
+            if args.non_interactive or not os.isatty(0) and not Path('/dev/tty').exists():
+                print(summary(state));return
+            try:manage(args,state)
+            except RuntimeError as e:
+                if '没有交互终端' not in str(e):raise
+                print(summary(state))
+            return
+        prepare_download_auth(args)
+        finish(args,state);return
     for service in ('V2bX.service','whalenode.service'):
         if service=='whalenode.service' and state.get('owns_service'):
             run('systemctl','stop',service,check=False)
@@ -413,11 +595,13 @@ def main(argv=None):
     if state.get('ids') and (groups != state.get('groups') or routes != state.get('routes')):
         raise ValueError('续跑必须保留原面板权限组和路由组')
     state.update(groups=groups,routes=routes)
-    def credential(value, path, prompt):
-        if value:return value
-        if path:return path.read_text().strip()
-        if args.non_interactive:raise ValueError('非交互模式缺少密钥参数或凭据文件')
-        return getpass.getpass(prompt)
+    node_group=args.node_group or state.get('node_group') or 'legacy_all'
+    if not re.fullmatch('[a-z0-9_]{1,48}',node_group):raise ValueError('网关节点分组格式无效')
+    if state.get('ids') and node_group!=state.get('node_group',node_group):raise ValueError('续跑不能更改 --node-group')
+    state['node_group']=node_group
+    state['publish']=args.publish if args.publish is not None else state.get('publish',True)
+    def credential(value, path, label):
+        return secret(args,value,path,label)
     if not args.api_key and not args.api_key_file and (CONF/'config.json').exists():
         previous=json.loads((CONF/'config.json').read_text())
         nodes=previous.get('Nodes',[])
@@ -484,10 +668,13 @@ def main(argv=None):
         matches=[x for x in all_nodes if x.get('type')==typ and x.get('name')==name]
         if proto in state['ids']:
             matches=[x for x in all_nodes if x.get('type')==typ and int(x['id'])==state['ids'][proto]]
-        elif matches and not all(state['nonce'] in (x.get('tags') or []) for x in matches):
-            raise RuntimeError('已有非本任务节点使用此名称，未接管或覆盖')
+        # 任何协议表里重名都会让网关整份订阅 4008，所以跨表检查。
+        elif any(x.get('name')==name and state['nonce'] not in (x.get('tags') or []) for x in all_nodes):
+            raise RuntimeError('面板已有同名节点（任意协议），未接管或覆盖：'+name)
         if not matches:
-            payload={'name':name,'host':state['host'],'port':port,'server_port':port,'group_id':groups,'route_id':routes,'rate':1,'show':0,'tags':[state['nonce']]}
+            tags=[MARK,state['nonce'],'wn-group:'+state['node_group'],'wn-cpu:'+str(facts['cpus']),
+                  'wn-ssh:'+str(ssh_port()),'wn-name:'+state['name']]
+            payload={'name':name,'host':state['host'],'port':port,'server_port':port,'group_id':groups,'route_id':routes,'rate':1,'show':0,'tags':tags}
             if proto=='vless':payload.update(tls=2,network='tcp',flow='xtls-rprx-vision',tls_settings={'server_name':state['snis'][proto],'server_port':'443'})
             else:
                 payload.update(server_name=state['snis'][proto],insecure=1)
@@ -502,7 +689,6 @@ def main(argv=None):
         if int(matches[0].get('server_port',0))!=port:raise RuntimeError('面板节点端口与任务不一致，停止续跑')
         state['ids'][proto]=int(matches[0]['id']);save('panel')
         print('面板节点已核对：'+proto+' #'+str(state['ids'][proto]),flush=True)
-    del admin
     if run('id','-u','whalenode',check=False).returncode:
         run('useradd','--system','--home-dir',str(CONF),'--shell','/usr/sbin/nologin','whalenode')
     uid=int(run('id','-u','whalenode').stdout)
@@ -564,7 +750,23 @@ def main(argv=None):
         raise RuntimeError('后端监听未就绪，已停止失败服务，协议：'+','.join(missing)+'；使用 journalctl -u whalenode 检查后可原命令续跑')
     verify_service(state)
     save('installed')
-    print('本机安装完成，面板节点仍保持隐藏。还需完成公网 TCP/UDP 协议测试、产品分组及监控验收；请核实入站防火墙规则。')
+    print('本机安装完成：'+', '.join(p+' 端口 '+str(PROTOCOLS[p][1])+('/udp' if p=='hy2' else '/tcp') for p in selected)+
+          '（云安全组需放行这些端口）。',flush=True)
+    finish(args,state,admin)
+
+def finish(args,state,admin=None):
+    """安装后的自动步骤：监控 → 面板显示 → 等源站接入调度/分组/监控。每步可续跑。"""
+    if not state.get('monitor'):install_monitor(args,state)
+    if not state.get('publish',True):
+        print('已按 --no-publish 保持面板隐藏；需要上线时运行 --show。');return
+    if not state.get('published'):
+        admin=admin or admin_token(args)
+        set_show(state,admin,1)
+        save_state(state,'published')
+        print('面板已显示：'+', '.join(p+'#'+str(n) for p,n in state['ids'].items()),flush=True)
+    admin=admin or admin_token(args)
+    wait_sync(state,admin)
+    print('管理：再次运行本脚本可选择 面板隐藏 / 重新显示 / 卸载；或直接用 --hide、--show、--uninstall。')
 
 if __name__=='__main__':
     try:main()

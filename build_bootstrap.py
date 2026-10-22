@@ -27,6 +27,7 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --api-key-file 文件     从本机文件读取节点密钥
   --admin-token-file 文件 从本机文件读取管理员凭据
   --download-token-file 文件 私有下载 Bearer 令牌文件（root 专属，不保存令牌）
+  --download-token 令牌    私有下载 Bearer 令牌（不保存）
   --download-token-prompt 隐藏输入私有下载令牌（不保存）
 
 可选参数：
@@ -40,12 +41,17 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --check                只读检查服务、端口、配置权限及 IPv6 出口规则
   --report-file 文件      配合 --check 导出脱敏 JSON 报告（必须是新文件）
   --rollback             停止本任务服务，恢复本任务修改的系统参数
+  --node-group 分组       网关节点分组，默认 legacy_all（Whale + 旧 Super 共用）
+  --no-publish           安装后保持面板隐藏（默认直接显示）
+  --hide / --show        面板隐藏 / 重新显示本机节点
+  --uninstall [--yes]    隐藏并删除面板节点，卸载本机 WhaleNode 与监控
   --non-interactive      禁止询问，缺参数直接报错
   --help                 显示本帮助
 
 注意：节点 API 密钥不等于管理员授权值，自动建节点需要两者。
-安装后节点保持隐藏，公网 TCP/UDP 协议测试、产品分组和监控验收完成后再发布。
-第一次运行填写后台信息及发布清单；已有任务保留参数，失败后可以续跑。
+安装后默认直接在面板显示，并自动安装 Zabbix 监控；源站每分钟自动对账，
+完成调度登记、节点分组和 Grafana/Zabbix 清单。再次运行本脚本出现管理菜单：
+本机自检 / 面板隐藏 / 重新显示 / 卸载。失败后用原命令续跑。
 HELP
   exit 0
 fi

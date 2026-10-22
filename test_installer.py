@@ -178,4 +178,73 @@ class DownloadAuthTests(unittest.TestCase):
             i.manifest('https://files.test/manifest','x86_64',token='Bearer download')
         request.assert_called_once_with('https://files.test/manifest','Bearer download')
 
+class PanelLifecycleTests(unittest.TestCase):
+    def state(self):
+        return {'admin_url':'https://panel.test/api/v1/x','nonce':'abcdef012345','ids':{'hy2':7,'vless':7},'protocols':['hy2','vless']}
+    def nodes(self,show,tags=None):
+        tags=tags or ['wn-installer','abcdef012345']
+        return {'data':[{'type':'hysteria','id':7,'show':show,'tags':tags},{'type':'vless','id':7,'show':show,'tags':tags},
+                        {'type':'vless','id':8,'show':1,'tags':['other']}]}
+    def test_show_updates_each_protocol_and_verifies(self):
+        state=self.state();calls=[]
+        def request(url,token=None,data=None):
+            calls.append((url,data))
+            return self.nodes(1) if url.endswith('getNodes') else {'data':True}
+        with tempfile.TemporaryDirectory() as d,patch.object(i,'ROOT',Path(d)),patch.object(i,'request',side_effect=request):
+            i.set_show(state,'admin',1)
+        self.assertTrue(state['published'])
+        self.assertIn(('https://panel.test/api/v1/x/server/hysteria/update',{'id':7,'show':1}),calls)
+        self.assertIn(('https://panel.test/api/v1/x/server/vless/update',{'id':7,'show':1}),calls)
+    def test_show_fails_when_panel_did_not_change(self):
+        def request(url,token=None,data=None):
+            return self.nodes(0) if url.endswith('getNodes') else {'data':True}
+        with tempfile.TemporaryDirectory() as d,patch.object(i,'ROOT',Path(d)),patch.object(i,'request',side_effect=request):
+            with self.assertRaises(RuntimeError):i.set_show(self.state(),'admin',1)
+    def test_same_id_in_two_tables_is_kept_apart(self):
+        with patch.object(i,'request',return_value=self.nodes(1)):
+            self.assertEqual(set(i.ours(self.state(),'admin')),{('hysteria',7),('vless',7)})
+    def test_manifest_monitor_entry(self):
+        self.assertEqual(i.monitor_entry({'monitor':{'url':'https://f.test/m.sh','sha256':'c'*64}})['monitor_sha256'],'c'*64)
+        self.assertEqual(i.monitor_entry({}),{})
+        with self.assertRaises(ValueError):i.monitor_entry({'monitor':{'url':'http://f.test/m.sh','sha256':'c'*64}})
+    def test_wait_sync_reports_completion(self):
+        with patch.object(i,'request',return_value=self.nodes(1,['wn-installer','abcdef012345','wn-synced'])),patch('sys.stdout',new_callable=io.StringIO):
+            self.assertTrue(i.wait_sync(self.state(),'admin',timeout=5))
+    def test_noninteractive_uninstall_needs_yes(self):
+        args=i.parser().parse_args(['--uninstall','--non-interactive'])
+        with self.assertRaises(ValueError):i.uninstall(args,self.state())
+    def test_uninstall_stops_backend_before_dropping_rows(self):
+        args=i.parser().parse_args(['--uninstall','--yes','--admin-token','t'])
+        state=dict(self.state(),published=True);events=[]
+        remaining={('hysteria',7),('vless',7)}
+        def request(url,token=None,data=None):
+            if url.endswith('getNodes'):
+                return {'data':[{'type':t,'id':n,'show':0,'tags':['abcdef012345']} for t,n in remaining]}
+            if url.endswith('/drop'):
+                events.append('drop');remaining.discard((url.split('/')[-2],data['id']))
+            return {'data':True}
+        def run(*a,**k):
+            if a[:3]==('systemctl','disable','--now') and a[3]=='whalenode.service':events.append('stop')
+            from types import SimpleNamespace
+            return SimpleNamespace(stdout='',returncode=0)
+        with tempfile.TemporaryDirectory() as d,patch.object(i,'ROOT',Path(d)/'state'),patch.object(i,'CONF',Path(d)/'conf'),\
+             patch.object(i,'request',side_effect=request),patch.object(i,'run',side_effect=run),patch.object(i.shutil,'rmtree'),\
+             patch('sys.stdout',new_callable=io.StringIO):
+            (Path(d)/'state').mkdir()
+            i.uninstall(args,state)
+        self.assertEqual(events[0],'stop');self.assertEqual(events.count('drop'),2)
+    def test_mode_flags_are_exclusive(self):
+        with patch('sys.stderr',new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):i.parser().parse_args(['--hide','--uninstall'])
+    def test_publish_defaults_on(self):
+        self.assertIsNone(i.parser().parse_args([]).publish)
+        self.assertFalse(i.parser().parse_args(['--no-publish']).publish)
+    def test_direct_download_token(self):
+        args=i.parser().parse_args(['--download-token','abc'])
+        i.prepare_download_auth(args);self.assertEqual(args._download_token,'abc')
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'t';path.write_text('x')
+            args=i.parser().parse_args(['--download-token','abc','--download-token-file',str(path)])
+            with self.assertRaises(ValueError):i.prepare_download_auth(args)
+
 if __name__=='__main__':unittest.main()

@@ -7,7 +7,7 @@
 以 root 登录，用下面这一整行启动安装，**不要追加 `--help`**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.2.1/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.0/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
 ```
 
 下载地址不能直接作为 shell 命令执行。下载和执行必须使用同一个文件名。`--help` 只显示帮助，不会安装。
@@ -30,9 +30,22 @@ curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0
 
 管理 API 前缀和授权值应由面板管理员提供。授权值与面板请求的 `Authorization` 内容一致，安装器不会自行添加 `Bearer`。节点 API Key 没有创建节点权限，不能代替管理员授权。
 
-安装器读取机器资源 → 核对面板 → 校验 WhaleNode 制品 → 创建隐藏节点 → 安装服务及出口规则 → 检查运行文件哈希和协议监听。失败会说明原因，可以修复后运行原命令续跑。
+安装器读取机器资源 → 核对面板 → 校验 WhaleNode 制品 → 创建面板节点 → 安装服务及出口规则 → 检查运行文件哈希和协议监听 → 安装 Zabbix 监控 → **直接在面板显示** → 等待源站自动接入。失败会说明原因，可以修复后运行原命令续跑。
 
-**安装完成后节点仍为隐藏状态。** 运营方需放行入站端口、完成外部客户端协议测试，确认权限组与监控接入后再在面板发布。此脚本不会把本机监听成功等同于伊朗、俄罗斯或其他用户网络可用。
+**默认安装后直接显示，不做外部可用性测试。** 面板显示后，运营方源站的对账任务（每分钟）会自动完成调度容量登记、网关节点分组和 Zabbix/Grafana 监控清单，完成后安装器提示“源站接入完成”。不希望立即上线时加 `--no-publish`，之后用 `--show` 上线。云安全组仍需放行下表端口；脚本不改云厂商防火墙。
+
+### 再次运行：管理菜单
+
+已安装的机器再次执行同一条命令，会显示当前状态并给出菜单：
+
+| 选项 | 作用 |
+| --- | --- |
+| 1 本机自检 | 同 `--check` |
+| 2 面板隐藏 | 用户不再收到这台节点（同 `--hide`） |
+| 3 面板重新显示 | 同 `--show` |
+| 4 卸载 | 隐藏并删除面板节点，停止并移除 WhaleNode、出口规则、系统参数和 Zabbix 监控；源站随后自动删除监控资产和调度登记（同 `--uninstall`，自动化加 `--yes`） |
+
+隐藏、显示和卸载都需要面板管理员授权值（可带 `--admin-token`，否则隐藏输入）。
 
 ## 参数与记忆
 
@@ -43,7 +56,7 @@ bash /root/whalenode-install.sh \
   --api-url 'https://panel.example.com' \
   --admin-url 'https://panel.example.com/api/v1/ADMIN_PATH' \
   --release-manifest 'https://downloads.example.com/private/manifest.json' \
-  --name '自定义名称' --protocols vless,hy2,anytls --group-ids 1
+  --name '自定义名称' --protocols vless,hy2,anytls --group-ids 1 --node-group legacy_all
 ```
 
 以上域名和管理路径是占位符，必须换成运营方提供的值。
@@ -64,7 +77,7 @@ bash /root/whalenode-install.sh \
 
 自动化可以使用 `--non-interactive`，缺参数直接失败；用 `--api-key-file /root/node-key` 和 `--admin-token-file /root/admin-token` 从权限 0600 的文件读取密钥。也支持 `--api-key`、`--admin-token`，但直接写在命令行可能进入历史和进程参数，优先使用隐藏输入或凭据文件。不要使用 `bash -x`。
 
-其他参数：`--host IPv4` 指定入口 IP；`--sni 域名` 指定已测试的 TLS 域名。默认自动测试候选 SNI 并避开面板中已使用的候选。候选不足会停止，不自动复用。`--binary-url`、`--binary-sha256`、`--source-commit` 可代替发布清单。
+其他参数：`--node-group 分组` 指定网关节点分组（默认 `legacy_all`）；`--download-token 令牌` 直接提供私有下载令牌；`--host IPv4` 指定入口 IP；`--sni 域名` 指定已测试的 TLS 域名。默认自动测试候选 SNI 并避开面板中已使用的候选。候选不足会停止，不自动复用。`--binary-url`、`--binary-sha256`、`--source-commit` 可代替发布清单。
 
 ## 后端下载与安全边界
 
@@ -95,7 +108,7 @@ bash /root/whalenode-install.sh --download-token-prompt
 }
 ```
 
-`arm64` 使用同样结构。清单按当前架构选择制品；续跑使用已记录的版本，不随远程清单更新自动升级。运营方可用以下工具生成清单，再上传至自己的 HTTPS 下载服务：
+清单可另带顶层 `"monitor": {"url": "...", "sha256": "..."}`，指向运营方的监控接入脚本（含 Zabbix 自动注册 PSK，只放在私有下载后面）；直接显示节点前必须安装监控。`arm64` 使用同样结构。清单按当前架构选择制品；续跑使用已记录的版本，不随远程清单更新自动升级。运营方可用以下工具生成清单，再上传至自己的 HTTPS 下载服务：
 
 ```bash
 python3 make_manifest.py --archive whalenode.gz \
@@ -148,13 +161,13 @@ bash /root/whalenode-install.sh --status
 
 脚本拒绝接管未知配置和现有代理服务。面板写请求遇到超时不会立即重复提交，下次按持久任务标签核对记录。不要通过删除状态文件“重试”，否则会丢失关联和回滚依据。
 
-`--rollback` 停止并禁用本任务服务，移除本任务 nftables 表和配置文件、恢复记录的 sysctl。它会中断该节点流量；保留本机密钥配置、任务状态、已下载制品和隐藏面板行，以便续跑。不是彻底卸载，也不会删除其他业务或面板节点。
+`--rollback` 停止并禁用本任务服务，移除本任务 nftables 表和配置文件、恢复记录的 sysctl。它会中断该节点流量；保留本机密钥配置、任务状态、已下载制品和面板行，以便续跑。不是彻底卸载；彻底移除用 `--uninstall`。
 
 ## 兼容与验收范围
 
 面板需兼容 `server/manage/getNodes` 和 `server/{vless,hysteria,anytls}/save` 管理接口，以及 WhaleNode 使用的节点接口。不同 V2Board 分支不保证兼容。
 
-安装器负责本机后端、面板隐藏节点和有界调优。Grafana/Zabbix 注册、各产品订阅发布和目标国家网络验收依赖运营方现有运维系统，不内置私有监控凭据，也不会自动完成这些步骤。
+安装器负责本机后端、面板节点、Zabbix agent 和有界调优；调度登记、网关节点分组、监控清单与 Grafana 映射由运营方源站的对账任务按面板标签自动完成。公开仓库不含任何监控凭据。安装器不做目标国家网络验收，节点上线后的实际可用性需要运营方观察，必要时用 `--hide` 撤回。
 
 ## 实测记录
 
