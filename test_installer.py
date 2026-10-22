@@ -179,6 +179,25 @@ class DownloadAuthTests(unittest.TestCase):
         request.assert_called_once_with('https://files.test/manifest','Bearer download')
 
 class BootstrapTests(unittest.TestCase):
+    def test_installed_machine_appends_protocols_instead_of_menu(self):
+        class Reached(Exception):pass
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);state={'phase':'published','protocols':['hy2','anytls'],'ids':{'hy2':1,'anytls':2},'published':True,'monitor':'AUTO-X','nonce':'abcdef012345'}
+            (root/'state.json').write_text(json.dumps(state))
+            with patch.object(i.os,'geteuid',return_value=0),patch.object(i,'ROOT',root),patch.object(i,'wizard',side_effect=Reached),patch.object(i,'manage',side_effect=AssertionError('menu')),                 patch.object(i,'prepare_download_auth'),patch.object(i,'run',return_value=type('R',(),{'returncode':1,'stdout':''})()),patch('sys.stdout',new_callable=io.StringIO):
+                with self.assertRaises(Reached):i.main(['--protocols','vless,hy2,anytls'])
+            saved=json.loads((root/'state.json').read_text())
+            self.assertEqual((saved['phase'],saved['published']),('adding',False))
+    def test_reality_sni_requires_tls13(self):
+        class Fake:
+            def __init__(self,v):self.v=v
+            def __enter__(self):return self
+            def __exit__(self,*a):return False
+            def version(self):return self.v
+        ctx=type('C',(),{'wrap_socket':lambda self,sock,server_hostname:Fake('TLSv1.2' if server_hostname=='www.php.net' else 'TLSv1.3')})()
+        with patch.object(i.socket,'create_connection',return_value=Fake(None)),patch.object(i.ssl,'create_default_context',return_value=ctx):
+            self.assertEqual(i.choose_sni(set()),'www.php.net')
+            self.assertEqual(i.choose_sni(set(),tls13=True),'www.oracle.com')
     def test_public_address_lookup_forces_ipv4(self):
         seen=[]
         def fake_request(url,token=None,data=None):

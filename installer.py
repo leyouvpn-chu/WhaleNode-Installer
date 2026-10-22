@@ -241,13 +241,14 @@ def wizard(args,state):
             if not getattr(args,name) and not state.get(name) and interactive:
                 setattr(args,name,prompt(label,required=True))
 
-def choose_sni(used):
+def choose_sni(used,tls13=False):
     for host in ('www.php.net','www.oracle.com','www.microsoft.com','www.apple.com','www.cloudflare.com'):
         if host in used:continue
         try:
             with socket.create_connection((host,443),timeout=5) as sock:
                 with ssl.create_default_context().wrap_socket(sock,server_hostname=host) as tls:
-                    if tls.version():return host
+                    # REALITY 借用目标站握手，必须支持 TLS 1.3。
+                    if tls.version() and (not tls13 or tls.version()=='TLSv1.3'):return host
         except OSError:continue
     raise RuntimeError('自动 SNI 测试没有通过，请通过 --sni 指定已验证域名')
 
@@ -540,7 +541,15 @@ def main(argv=None):
         rollback(state);return
     if args.hide or args.show or args.uninstall:
         manage(args,state);return
-    if state.get('phase') in ('installed','published'):
+    def wanted(value):
+        return list(dict.fromkeys(x.strip().lower() for x in value.split(',') if x.strip()))
+    added=[x for x in wanted(args.protocols) if x not in state.get('protocols',[])] if args.protocols and state.get('protocols') else []
+    if added and state.get('phase') in ('installed','published'):
+        # 追加协议：已有面板行保留，只为新增协议建行，重写配置、重启后端，再显示全部线路。
+        print('追加协议：'+','.join(added)+'（已有 '+','.join(state['protocols'])+' 保留）',flush=True)
+        state['publish']=state.get('publish',True) if args.publish is None else args.publish
+        state['published']=False;save_state(state,'adding')
+    elif state.get('phase') in ('installed','published'):
         if run('systemctl','is-active','--quiet','whalenode.service',check=False).returncode:
             raise RuntimeError('任务记录已安装，但服务没有运行；请检查 journalctl -u whalenode，再执行 --rollback 后续跑')
         verify_service(state)
@@ -568,9 +577,11 @@ def main(argv=None):
     print('WhaleNode 中文安装向导。已有参数自动采用，密钥隐藏输入。',flush=True)
     prepare_download_auth(args)
     wizard(args,state)
-    selected = list(dict.fromkeys(x.strip().lower() for x in (args.protocols or ','.join(state.get('protocols', ['vless','hy2']))).split(',')))
+    selected = wanted(args.protocols or ','.join(state.get('protocols', ['vless','hy2'])))
+    if state.get('protocols') and set(state['protocols'])<=set(selected):
+        selected=state['protocols']+[x for x in selected if x not in state['protocols']]
     if not selected or any(p not in PROTOCOLS for p in selected): raise ValueError('支持的协议：vless,hy2,anytls')
-    if state.get('protocols') and selected != state['protocols']: raise ValueError('续跑必须保留原有协议组合')
+    if state.get('protocols') and selected[:len(state['protocols'])] != state['protocols']: raise ValueError('只能追加协议，不能去掉已有协议；去掉请先 --uninstall')
     facts = resources()
     for name in ('api_url','admin_url','binary_url','binary_sha256','source_commit','host','name','sni'):
         value = getattr(args,name) or state.get(name)
@@ -640,7 +651,7 @@ def main(argv=None):
         if isinstance(tls,dict):used.add(tls.get('server_name',''))
     for proto in selected:
         if proto not in state['snis']:
-            state['snis'][proto]=state.get('sni') or choose_sni(used)
+            state['snis'][proto]=state.get('sni') or choose_sni(used,tls13=proto=='vless')
             used.add(state['snis'][proto]);save('preflight')
     print('后台连接通过；正在校验后端发布包…',flush=True)
     releases = Path('/opt/whalenode/releases'); releases.mkdir(parents=True,exist_ok=True)
@@ -685,7 +696,7 @@ def main(argv=None):
             tags=[MARK,state['nonce'],'wn-group:'+state['node_group'],'wn-cpu:'+str(facts['cpus']),
                   'wn-ssh:'+str(ssh_port()),'wn-name:'+state['name']]
             payload={'name':name,'host':state['host'],'port':port,'server_port':port,'group_id':groups,'route_id':routes,'rate':1,'show':0,'tags':tags}
-            if proto=='vless':payload.update(tls=2,network='tcp',flow='xtls-rprx-vision',tls_settings={'server_name':state['snis'][proto],'server_port':'443'})
+            if proto=='vless':payload.update(tls=2,network='tcp',flow='xtls-rprx-vision',encryption='none',tls_settings={'server_name':state['snis'][proto],'dest':state['snis'][proto],'server_port':'443','cert_mode':'none','allow_insecure':'0','reject_unknown_sni':'0'})
             else:
                 payload.update(server_name=state['snis'][proto],insecure=1)
                 if proto=='hy2':payload.update(version=2,obfs='salamander',obfs_password=secrets.token_hex(16),up_mbps=0,down_mbps=0)
@@ -694,7 +705,8 @@ def main(argv=None):
             if result.get('data') is not True:raise RuntimeError('面板未确认节点创建成功')
             all_nodes=rows(request(state['admin_url']+'/server/manage/getNodes',admin))
             matches=[x for x in all_nodes if x.get('type')==typ and x.get('name')==name and state['nonce'] in (x.get('tags') or [])]
-        if len(matches)!=1 or matches[0].get('host')!=state['host'] or int(matches[0].get('show',0))!=0 or state['nonce'] not in (matches[0].get('tags') or []):
+        # 新建的行必须仍是隐藏；追加协议时，已发布的老行保持显示。
+        if len(matches)!=1 or matches[0].get('host')!=state['host'] or (proto not in state['ids'] and int(matches[0].get('show',0))!=0) or state['nonce'] not in (matches[0].get('tags') or []):
             raise RuntimeError('面板节点核对失败，新建节点仍保持隐藏')
         if int(matches[0].get('server_port',0))!=port:raise RuntimeError('面板节点端口与任务不一致，停止续跑')
         state['ids'][proto]=int(matches[0]['id']);save('panel')

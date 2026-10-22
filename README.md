@@ -7,7 +7,7 @@
 以 root 登录，用下面这一整行启动安装，**不要追加 `--help`**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.2/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.3/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
 ```
 
 下载地址不能直接作为 shell 命令执行。下载和执行必须使用同一个文件名。`--help` 只显示帮助，不会安装。
@@ -44,6 +44,8 @@ curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0
 | 2 面板隐藏 | 用户不再收到这台节点（同 `--hide`） |
 | 3 面板重新显示 | 同 `--show` |
 | 4 卸载 | 隐藏并删除面板节点，停止并移除 WhaleNode、出口规则、系统参数和 Zabbix 监控；源站随后自动删除监控资产和调度登记（同 `--uninstall`，自动化加 `--yes`） |
+
+追加协议：同一条命令把 `--protocols` 改成更多协议（例如 `vless,hy2,anytls`）再运行，会保留已有线路、补建新协议节点、重启后端并显示；不能用这种方式去掉协议。
 
 隐藏、显示和卸载都需要面板管理员授权值（可带 `--admin-token`，否则隐藏输入）。
 
