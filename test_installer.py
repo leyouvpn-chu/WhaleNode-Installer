@@ -178,6 +178,18 @@ class DownloadAuthTests(unittest.TestCase):
             i.manifest('https://files.test/manifest','x86_64',token='Bearer download')
         request.assert_called_once_with('https://files.test/manifest','Bearer download')
 
+class BootstrapTests(unittest.TestCase):
+    def test_install_sh_embeds_current_installer(self):
+        # v0.3.0 shipped a stale install.sh: run build_bootstrap.py after editing installer.py.
+        root=Path(i.__file__).resolve().parent
+        script=(root/'install.sh').read_text(encoding='utf-8')
+        self.assertIn((root/'installer.py').read_text(encoding='utf-8'),script)
+    def test_documented_one_line_arguments_parse(self):
+        args=i.parser().parse_args(['--api-url','https://a.test','--admin-url','https://a.test/api/v1/x',
+            '--release-manifest','https://f.test/manifest.json','--download-token','t','--api-key','k',
+            '--admin-token','a','--protocols','hy2,anytls','--group-ids','1','--node-group','legacy_all'])
+        self.assertEqual((args.download_token,args.node_group),('t','legacy_all'))
+
 class PanelLifecycleTests(unittest.TestCase):
     def state(self):
         return {'admin_url':'https://panel.test/api/v1/x','nonce':'abcdef012345','ids':{'hy2':7,'vless':7},'protocols':['hy2','vless']}

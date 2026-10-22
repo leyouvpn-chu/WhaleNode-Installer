@@ -24,6 +24,7 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --api-key-file 文件     从本机文件读取节点密钥
   --admin-token-file 文件 从本机文件读取管理员凭据
   --download-token-file 文件 私有下载 Bearer 令牌文件（root 专属，不保存令牌）
+  --download-token 令牌    私有下载 Bearer 令牌（不保存）
   --download-token-prompt 隐藏输入私有下载令牌（不保存）
 
 可选参数：
@@ -199,6 +200,7 @@ def parser():
     mode.add_argument('--check', action='store_true', help='只读检查运行文件、监听、配置权限及 IPv6 出口规则')
     p.add_argument('--report-file', type=Path, help='配合 --check 输出不含凭据的 JSON 验收报告')
     p.add_argument('--download-token-file', type=Path, help='私有下载 Bearer 令牌文件，仅本次使用')
+    p.add_argument('--download-token', help='私有下载 Bearer 令牌（会进入命令历史；优先用文件或隐藏输入）')
     p.add_argument('--download-token-prompt', action='store_true', help='隐藏输入私有下载 Bearer 令牌')
     mode.add_argument('--plan', action='store_true')
     p.add_argument('--non-interactive', action='store_true', help='禁止交互，缺少参数时直接报错')
@@ -239,11 +241,11 @@ def download_auth(args, url, allowed_origin):
     return 'Bearer '+token
 
 def prepare_download_auth(args):
-    if args.download_token_file and args.download_token_prompt:
-        raise ValueError('下载令牌文件和隐藏输入不能同时使用')
+    if sum(map(bool,(args.download_token,args.download_token_file,args.download_token_prompt)))>1:
+        raise ValueError('下载令牌只能用一种方式提供')
     if args.download_token_prompt and args.non_interactive:
         raise ValueError('非交互模式请使用 --download-token-file')
-    token=None
+    token=args.download_token
     if args.download_token_file:
         fd=os.open(args.download_token_file,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
         with os.fdopen(fd) as f:

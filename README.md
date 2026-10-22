@@ -7,7 +7,7 @@
 以 root 登录，用下面这一整行启动安装，**不要追加 `--help`**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.0/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.1/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
 ```
 
 下载地址不能直接作为 shell 命令执行。下载和执行必须使用同一个文件名。`--help` 只显示帮助，不会安装。
