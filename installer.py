@@ -241,8 +241,25 @@ def wizard(args,state):
             if not getattr(args,name) and not state.get(name) and interactive:
                 setattr(args,name,prompt(label,required=True))
 
+# 机队 REALITY 候选池（ops reality-sni-pool.json：俄罗斯观测点 SNI 实测通过，TLS 1.3 + h2 + X25519）。
+SNI_POOL=(
+    'www.intel.com','www.lg.com','www.python.org','www.qualcomm.com','www.samsung.com','www.postgresql.org',
+    'www.kernel.org','www.tesla.com','www.sony.com','www.speedtest.net','www.cisco.com','www.oracle.com',
+    'www.ibm.com','www.dell.com','www.asus.com','www.siemens.com','www.philips.com','www.canon.com',
+    'www.epson.com','www.nokia.com','www.sap.com','www.xerox.com','www.fujitsu.com','www.debian.org',
+    'www.redhat.com','www.jetbrains.com','www.lenovo.com','www.bosch.com','www.panasonic.com',
+    'www.toshiba.com','www.logitech.com','www.autodesk.com','www.adobe.com','www.atlassian.com',
+    'www.spotify.com','www.booking.com','www.abb.com','www.schneider-electric.com','www.bmw.com',
+    'www.volkswagen.com','www.shell.com','www.airbus.com','www.ricoh.com','www.brother.com','www.zeiss.com',
+    'www.bayer.com','www.basf.com','www.nxp.com','www.infineon.com','www.st.com','www.arm.com',
+    'www.micron.com','www.juniper.net','www.arista.com','www.netapp.com','www.citrix.com','www.apache.org',
+    'www.php.net','www.rust-lang.org','www.thalesgroup.com','www.continental.com','www.olympus-global.com',
+    'www.yamaha.com','www.denso.com',
+)
+
 def choose_sni(used,tls13=False):
-    for host in ('www.php.net','www.oracle.com','www.microsoft.com','www.apple.com','www.cloudflare.com'):
+    # 随机顺序：全队挑同一个 SNI 等于给封锁方一个聚类特征。
+    for host in secrets.SystemRandom().sample(SNI_POOL,len(SNI_POOL)):
         if host in used:continue
         try:
             with socket.create_connection((host,443),timeout=5) as sock:

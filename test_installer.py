@@ -188,6 +188,12 @@ class BootstrapTests(unittest.TestCase):
                 with self.assertRaises(Reached):i.main(['--protocols','vless,hy2,anytls'])
             saved=json.loads((root/'state.json').read_text())
             self.assertEqual((saved['phase'],saved['published']),('adding',False))
+    def test_preflight_failure_does_not_stop_running_backend(self):
+        src=Path(i.__file__).read_text(encoding='utf-8')
+        main=src[src.index('def main('):]
+        self.assertLess(main.index("for service in ('V2bX.service','whalenode.service')"),main.index('choose_sni'))
+        self.assertEqual(main.count("run('systemctl','stop','whalenode.service',check=False)"),1)
+        self.assertLess(main.index('choose_sni'),main.index("run('systemctl','stop','whalenode.service',check=False)"))
     def test_reality_sni_requires_tls13(self):
         class Fake:
             def __init__(self,v):self.v=v
@@ -196,8 +202,11 @@ class BootstrapTests(unittest.TestCase):
             def version(self):return self.v
         ctx=type('C',(),{'wrap_socket':lambda self,sock,server_hostname:Fake('TLSv1.2' if server_hostname=='www.php.net' else 'TLSv1.3')})()
         with patch.object(i.socket,'create_connection',return_value=Fake(None)),patch.object(i.ssl,'create_default_context',return_value=ctx):
-            self.assertEqual(i.choose_sni(set()),'www.php.net')
-            self.assertEqual(i.choose_sni(set(),tls13=True),'www.oracle.com')
+            with patch.object(i,'SNI_POOL',('www.php.net','www.oracle.com')),patch.object(i.secrets.SystemRandom,'sample',lambda self,seq,n:list(seq)):
+                self.assertEqual(i.choose_sni(set()),'www.php.net')
+                self.assertEqual(i.choose_sni(set(),tls13=True),'www.oracle.com')
+                self.assertEqual(i.choose_sni({'www.php.net'}),'www.oracle.com')
+            self.assertGreaterEqual(len(i.SNI_POOL),60)
     def test_public_address_lookup_forces_ipv4(self):
         seen=[]
         def fake_request(url,token=None,data=None):
