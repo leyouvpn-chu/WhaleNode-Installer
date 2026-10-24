@@ -453,6 +453,51 @@ SNI_POOL=(
     'atcpulsa.store',
 )
 
+def validate_sni_pool(doc, max_age=7*86400):
+    if not isinstance(doc,dict) or doc.get('schema')!=1:raise ValueError('SNI 清单格式无效')
+    stamp=doc.get('generated_at')
+    if isinstance(stamp,bool) or not isinstance(stamp,(int,float)) or not 0 <= time.time()-stamp <= max_age:
+        raise ValueError('SNI 清单过期或时间无效')
+    names=doc.get('domains')
+    if not isinstance(names,list) or not 1 <= len(names) <= 4096:raise ValueError('SNI 候选数量无效')
+    for name in names:
+        if not isinstance(name,str) or len(name)>253 or '.' not in name or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label) for label in name.split('.')):
+            raise ValueError('SNI 候选域名无效')
+    return list(dict.fromkeys(names))
+
+
+def load_sni_pool(args,state):
+    # Stable data endpoint next to the manifest. Never follows redirects or sends
+    # download credentials to a different origin; no remote code is executed.
+    release=state.get('release_manifest')
+    if not release:
+        print('未配置发布清单，使用内置 SNI 应急候选；仍需本机 TLS 验证',flush=True)
+        return list(SNI_POOL)
+    url=urllib.parse.urljoin(release,'sni-pool.json')
+    cache=ROOT/'sni-pool-cache.json'
+    previous=None
+    try:
+        saved=json.loads(cache.read_text())
+        if saved.get('source')==url:
+            validate_sni_pool(saved['pool']);previous=saved['pool']
+    except (OSError,ValueError,KeyError,TypeError):pass
+    try:
+        auth=download_auth(args,url,release)
+        doc=request(url,auth) if auth else request(url)
+        names=validate_sni_pool(doc)
+        if previous and doc['generated_at'] < previous['generated_at']:
+            raise ValueError('SNI 清单版本倒退')
+        atomic(cache,json.dumps({'source':url,'pool':doc}))
+        print('SNI 实时清单：'+str(len(names))+' 个候选，更新于 '+time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime(doc['generated_at'])),flush=True)
+        return names
+    except (RuntimeError,ValueError,OSError,TypeError):
+        if previous:
+            print('SNI 在线更新失败，使用最近有效缓存；仍需本机 TLS 验证',flush=True)
+            return validate_sni_pool(previous)
+        print('SNI 在线更新失败且无有效缓存，使用内置应急候选；仍需本机 TLS 验证',flush=True)
+        return list(SNI_POOL)
+
+
 def sni_usage(nodes):
     counts=Counter()
     for node in nodes:
@@ -463,10 +508,11 @@ def sni_usage(nodes):
     return counts
 
 
-def choose_sni(used,tls13=False):
+def choose_sni(used,tls13=False,pool=None):
     counts=Counter(used)
     # Shuffle ties, then prefer unused / least-used domains. Reuse still requires TLS.
-    candidates=secrets.SystemRandom().sample(SNI_POOL,len(SNI_POOL))
+    pool=SNI_POOL if pool is None else pool
+    candidates=secrets.SystemRandom().sample(pool,len(pool))
     candidates.sort(key=lambda host:counts[host])
     failures=Counter()
     for host in candidates:
@@ -950,9 +996,10 @@ def main(argv=None):
     all_nodes = rows(request(state['admin_url']+'/server/manage/getNodes',admin))
     state.setdefault('snis',{})
     used=sni_usage(all_nodes)
+    pool=load_sni_pool(args,state) if not state.get('sni') and any(p not in state['snis'] for p in selected) else []
     for proto in selected:
         if proto not in state['snis']:
-            state['snis'][proto]=state.get('sni') or choose_sni(used,tls13=proto=='vless')
+            state['snis'][proto]=state.get('sni') or choose_sni(used,tls13=proto=='vless',pool=pool)
             used[state['snis'][proto].lower().rstrip('.')]+=1;save('preflight')
     print('后台连接通过；正在校验后端发布包…',flush=True)
     releases = Path('/opt/whalenode/releases'); releases.mkdir(parents=True,exist_ok=True)

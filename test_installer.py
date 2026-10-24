@@ -259,6 +259,36 @@ class BootstrapTests(unittest.TestCase):
         doc['finished']='2026-01-01T00:00:00+00:00'
         with self.assertRaises(ValueError):select(doc)
 
+    def test_dynamic_pool_refresh_and_cache_fallback(self):
+        from types import SimpleNamespace
+        args=SimpleNamespace(_download_token='secret')
+        state={'release_manifest':'https://dl.test/manifest.json'}
+        first={'schema':1,'generated_at':i.time.time()-10,'domains':['first.test']}
+        second={'schema':1,'generated_at':i.time.time(),'domains':['second.test']}
+        with tempfile.TemporaryDirectory() as d,patch.object(i,'ROOT',Path(d)),patch.object(i,'request',side_effect=[first,second,RuntimeError('offline')]) as req:
+            self.assertEqual(i.load_sni_pool(args,state),['first.test'])
+            self.assertEqual(i.load_sni_pool(args,state),['second.test'])
+            self.assertEqual(i.load_sni_pool(args,state),['second.test'])
+            self.assertEqual(req.call_args.args,('https://dl.test/sni-pool.json','Bearer secret'))
+            self.assertNotIn('secret',(Path(d)/'sni-pool-cache.json').read_text())
+
+    def test_dynamic_pool_rejects_bad_data_and_rollback(self):
+        from types import SimpleNamespace
+        for doc in ({'schema':1,'generated_at':0,'domains':['a.test']},
+                    {'schema':1,'generated_at':i.time.time(),'domains':['bad;command.test']},
+                    {'schema':1,'generated_at':i.time.time(),'domains':[]}):
+            with self.assertRaises(ValueError):i.validate_sni_pool(doc)
+        with tempfile.TemporaryDirectory() as d,patch.object(i,'ROOT',Path(d)):
+            args=SimpleNamespace(_download_token=None)
+            state={'release_manifest':'https://dl.test/manifest.json'}
+            fresh={'schema':1,'generated_at':i.time.time(),'domains':['fresh.test']}
+            old={'schema':1,'generated_at':i.time.time()-100,'domains':['old.test']}
+            with patch.object(i,'request',side_effect=[fresh,old]):
+                self.assertEqual(i.load_sni_pool(args,state),['fresh.test'])
+                self.assertEqual(i.load_sni_pool(args,state),['fresh.test'])
+            with patch.object(i,'request',side_effect=RuntimeError('offline')):
+                self.assertEqual(i.load_sni_pool(args,{'release_manifest':'https://other.test/manifest.json'}),list(i.SNI_POOL))
+
     def test_sni_pool_unique_and_expanded(self):
         self.assertEqual(len(i.SNI_POOL),len(set(i.SNI_POOL)))
         self.assertGreaterEqual(len(i.SNI_POOL),128)
