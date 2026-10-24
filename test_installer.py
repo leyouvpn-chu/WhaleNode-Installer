@@ -187,13 +187,40 @@ class BootstrapTests(unittest.TestCase):
             with patch.object(i.os,'geteuid',return_value=0),patch.object(i,'ROOT',root),patch.object(i,'wizard',side_effect=Reached),patch.object(i,'manage',side_effect=AssertionError('menu')),                 patch.object(i,'prepare_download_auth'),patch.object(i,'run',return_value=type('R',(),{'returncode':1,'stdout':''})()),patch('sys.stdout',new_callable=io.StringIO):
                 with self.assertRaises(Reached):i.main(['--protocols','vless,hy2,anytls'])
             saved=json.loads((root/'state.json').read_text())
-            self.assertEqual((saved['phase'],saved['published']),('adding',False))
+            self.assertEqual((saved['phase'],saved['published']),('published',True))
     def test_preflight_failure_does_not_stop_running_backend(self):
-        src=Path(i.__file__).read_text(encoding='utf-8')
-        main=src[src.index('def main('):]
-        self.assertLess(main.index("for service in ('V2bX.service','whalenode.service')"),main.index('choose_sni'))
-        self.assertEqual(main.count("run('systemctl','stop','whalenode.service',check=False)"),1)
-        self.assertLess(main.index('choose_sni'),main.index("run('systemctl','stop','whalenode.service',check=False)"))
+        from types import SimpleNamespace
+        state=dict(phase='published',protocols=['vless'],ids={'vless':1},published=True,owns_service=True,
+                   nonce='abcdef012345',node_group='original',api_url='https://api.test',admin_url='https://panel.test',
+                   binary_url='https://dl.test/backend.gz',binary_sha256='a'*64,source_commit='b'*40,
+                   host='203.0.113.1',name='existing',groups=[1],routes=[],snis={'vless':'old.test'})
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);(root/'state.json').write_text(json.dumps(state))
+            conf=root/'conf';conf.mkdir();(conf/'config.json').write_text('unchanged')
+            with patch.object(i,'ROOT',root),patch.object(i,'CONF',conf),patch.object(i.os,'geteuid',return_value=0),patch.object(i,'backend_preflight',return_value='123'),patch.object(i,'wizard'),patch.object(i,'resources',return_value={}),patch.object(i,'dependency_check'),patch.object(i,'run',return_value=SimpleNamespace(stdout='',returncode=0)) as run,patch.object(i,'request',return_value={'data':[]}),patch.object(i,'choose_sni',side_effect=RuntimeError('TLS failed')),patch('sys.stdout',new_callable=io.StringIO):
+                with self.assertRaisesRegex(RuntimeError,'TLS failed'):
+                    i.main(['--protocols','vless,anytls','--api-key','k','--admin-token','t','--node-group','legacy_all'])
+            self.assertFalse(any(c.args[:2]==('systemctl','stop') for c in run.call_args_list))
+            self.assertEqual((conf/'config.json').read_text(),'unchanged')
+            self.assertEqual(json.loads((root/'state.json').read_text())['node_group'],'original')
+
+    def test_resume_preserves_or_recovers_original_group(self):
+        state={'ids':{'vless':1},'node_group':'original','host':'node.test','nonce':'owned'}
+        self.assertEqual(i.resume_group('legacy_all',state),'original')
+        state['node_group']=None
+        row={'type':'vless','id':1,'host':'node.test','tags':['owned','wn-group:original']}
+        self.assertEqual(i.resume_group('legacy_all',state,[row]),'original')
+        with self.assertRaises(RuntimeError):i.resume_group('legacy_all',state,[])
+        self.assertEqual(i.resume_group(None,{}),'legacy_all')
+
+    def test_owned_ports_do_not_block_append_but_foreign_ports_do(self):
+        from types import SimpleNamespace
+        for owners,allowed in [('pid=123,fd=1',True),('pid=999,fd=1',False),('',False),('pid=123,fd=1 pid=999,fd=2',False)]:
+            with patch.object(i,'run',return_value=SimpleNamespace(stdout='LISTEN '+owners)):
+                if allowed:i.check_install_ports(['vless'],'123')
+                else:
+                    with self.assertRaises(RuntimeError):i.check_install_ports(['vless'],'123')
+
     def test_reality_sni_requires_tls13(self):
         class Fake:
             def __init__(self,v):self.v=v

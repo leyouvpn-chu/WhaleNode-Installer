@@ -854,6 +854,50 @@ def manage(args,state):
         set_show(state,admin_token(args),1 if choice=='3' else 0);print('完成：'+summary(state))
     elif choice=='4':uninstall(args,state)
 
+def resume_group(requested,state,nodes=None):
+    existing=state.get('node_group')
+    if state.get('ids') and not existing:
+        if nodes is None:return None
+        identities={(PROTOCOLS[p][0],int(nid)) for p,nid in state['ids'].items()}
+        groups=set()
+        for row in nodes:
+            if (row.get('type'),int(row.get('id',0))) not in identities:continue
+            if row.get('host')!=state.get('host') or state.get('nonce') not in (row.get('tags') or []):
+                raise RuntimeError('旧节点身份核对失败，未修改分组或服务')
+            groups.update(tag[9:] for tag in (row.get('tags') or []) if isinstance(tag,str) and tag.startswith('wn-group:'))
+        if len(groups)!=1:raise RuntimeError('无法唯一恢复原节点分组，未修改服务；请核对旧节点 wn-group 标签')
+        existing=groups.pop()
+        print('已从旧节点标签恢复分组：'+existing,flush=True)
+    chosen=existing if state.get('ids') else requested or existing or 'legacy_all'
+    if not isinstance(chosen,str) or not re.fullmatch('[a-z0-9_]{1,48}',chosen):raise ValueError('网关节点分组格式无效')
+    if state.get('ids') and requested and requested!=chosen:
+        print('追加/续跑沿用原分组 '+chosen+'；忽略命令中的 --node-group '+requested+'，不迁移已有节点',flush=True)
+    return chosen
+
+
+def backend_preflight(state):
+    for service in ('V2bX.service','whalenode.service'):
+        if run('systemctl','is-active','--quiet',service,check=False).returncode:continue
+        if service!='whalenode.service' or not state.get('owns_service'):
+            raise RuntimeError('发现已有后端服务，未覆盖：'+service)
+        pid=run('systemctl','show','-p','MainPID','--value',service).stdout.strip()
+        if not pid.isdigit() or int(pid)<=0:raise RuntimeError('无法确认已有后端进程，未停止服务')
+        if hashlib.sha256(Path('/proc/'+pid+'/exe').read_bytes()).hexdigest()!=state.get('binary_sha256'):
+            raise RuntimeError('已有后端哈希与安装记录不一致，未停止服务')
+        return pid
+    return None
+
+
+def check_install_ports(selected,pid):
+    for proto in selected:
+        sock='-Hlunp' if proto=='hy2' else '-Hltnp'
+        lines=run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines()
+        for line in lines:
+            owners=set(re.findall(r'pid=(\d+)',line))
+            if not pid or owners!={pid}:
+                raise RuntimeError('所需端口被其他进程占用，协议：'+proto+'；未停止已有服务')
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     if os.geteuid() != 0: raise RuntimeError('请使用 root 或 sudo 运行')
@@ -898,7 +942,7 @@ def main(argv=None):
         # 追加协议：已有面板行保留，只为新增协议建行，重写配置、重启后端，再显示全部线路。
         print('追加协议：'+','.join(added)+'（已有 '+','.join(state['protocols'])+' 保留）',flush=True)
         state['publish']=state.get('publish',True) if args.publish is None else args.publish
-        state['published']=False;save_state(state,'adding')
+        state['published']=False  # Persist only after preflight validation begins.
     elif state.get('phase') in ('installed','published'):
         if run('systemctl','is-active','--quiet','whalenode.service',check=False).returncode:
             raise RuntimeError('任务记录已安装，但服务没有运行；请检查 journalctl -u whalenode，再执行 --rollback 后续跑')
@@ -914,14 +958,7 @@ def main(argv=None):
             return
         prepare_download_auth(args)
         finish(args,state);return
-    for service in ('V2bX.service','whalenode.service'):
-        if service=='whalenode.service' and state.get('owns_service'):
-            run('systemctl','stop',service,check=False)
-            continue
-        if run('systemctl','is-active','--quiet',service,check=False).returncode==0:
-            if service=='whalenode.service' and state.get('owns_service'):
-                run('systemctl','stop',service)
-            else:raise RuntimeError('发现已有后端服务，未覆盖：'+service)
+    running_pid=backend_preflight(state)
     if not state and any(Path(p).exists() for p in (str(CONF),'/etc/systemd/system/whalenode.service','/etc/systemd/system/whalenode-egress.service','/etc/sysctl.d/90-whalenode.conf','/etc/whalenode-egress.nft')):
         raise RuntimeError('发现已有 WhaleNode 文件，请检查后再安装')
     print('WhaleNode 中文安装向导。已有参数自动采用，密钥隐藏输入。',flush=True)
@@ -966,10 +1003,7 @@ def main(argv=None):
     if state.get('ids') and (groups != state.get('groups') or routes != state.get('routes')):
         raise ValueError('续跑必须保留原面板权限组和路由组')
     state.update(groups=groups,routes=routes)
-    node_group=args.node_group or state.get('node_group') or 'legacy_all'
-    if not re.fullmatch('[a-z0-9_]{1,48}',node_group):raise ValueError('网关节点分组格式无效')
-    if state.get('ids') and node_group!=state.get('node_group',node_group):raise ValueError('续跑不能更改 --node-group')
-    state['node_group']=node_group
+    state['node_group']=resume_group(args.node_group,state)
     state['publish']=args.publish if args.publish is not None else state.get('publish',True)
     def credential(value, path, label):
         return secret(args,value,path,label)
@@ -988,12 +1022,12 @@ def main(argv=None):
         atomic(state_path,json.dumps(state,indent=2))
     save('preflight')
     dependency_check()
-    # Reject foreign listeners before downloading/configuring anything.
-    for proto in selected:
-        sock = '-lun' if proto=='hy2' else '-ltn'
-        if len(run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines())>1:
-            raise RuntimeError('所需端口已被占用，协议：'+proto)
+    # Owned listeners remain online during preflight; foreign owners still fail.
+    check_install_ports(selected,running_pid)
     all_nodes = rows(request(state['admin_url']+'/server/manage/getNodes',admin))
+    if not state.get('node_group'):
+        state['node_group']=resume_group(args.node_group,state,all_nodes)
+        save('preflight')
     state.setdefault('snis',{})
     used=sni_usage(all_nodes)
     pool=load_sni_pool(args,state) if not state.get('sni') and any(p not in state['snis'] for p in selected) else []
@@ -1059,6 +1093,9 @@ def main(argv=None):
         if int(matches[0].get('server_port',0))!=port:raise RuntimeError('面板节点端口与任务不一致，停止续跑')
         state['ids'][proto]=int(matches[0]['id']);save('panel')
         print('面板节点已核对：'+proto+' #'+str(state['ids'][proto]),flush=True)
+    exists=run('nft','list','table','inet','whalenode_egress',check=False).returncode==0
+    if exists and not state.get('owns_egress'):
+        raise RuntimeError('发现非本任务的出口规则表，请先检查')
     if run('id','-u','whalenode',check=False).returncode:
         run('useradd','--system','--home-dir',str(CONF),'--shell','/usr/sbin/nologin','whalenode')
     uid=int(run('id','-u','whalenode').stdout)
@@ -1068,15 +1105,16 @@ def main(argv=None):
         typ='hysteria2' if proto=='hy2' else proto
         nodes.append({'Core':'sing','ApiHost':state['api_url'],'ApiKey':api_key,'NodeID':state['ids'][proto],'NodeType':typ,'Timeout':180,'ListenIP':'0.0.0.0','SendIP':'0.0.0.0','CertConfig':{'CertMode':'self','CertDomain':state['snis'][proto],'CertFile':str(CONF/(proto+'.cer')),'KeyFile':str(CONF/(proto+'.key'))}})
     config={'Log':{'Level':'warn','Output':''},'Cores':[{'Type':'sing','Log':{'Level':'warn'},'OriginalPath':str(CONF/'sing_original.json')}],'Nodes':nodes}
+    # Only stop once all network/download/panel preflight has succeeded.
+    check_install_ports(selected,running_pid)
+    if state.get('owns_service'):
+        run('systemctl','stop','whalenode.service')
     atomic(CONF/'config.json',json.dumps(config))
     atomic(CONF/'sing_original.json',json.dumps({'route':{'rules':[]}}))
     run('chown','-R','whalenode:whalenode',str(CONF));CONF.chmod(0o700)
     # Own only this table. IPv6 management and other services are unaffected.
     table='table inet whalenode_egress {\n chain output {\n  type filter hook output priority 0; policy accept;\n  meta skuid '+str(uid)+' meta nfproto ipv6 counter reject\n }\n}\n'
     nft=Path('/etc/whalenode-egress.nft')
-    exists=run('nft','list','table','inet','whalenode_egress',check=False).returncode==0
-    if exists and not state.get('owns_egress'):
-        raise RuntimeError('发现非本任务的出口规则表，请先检查')
     atomic(nft,table)
     if not exists:
         run('nft','--check','-f',str(nft))
