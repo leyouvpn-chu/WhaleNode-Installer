@@ -27,6 +27,7 @@ import urllib.request
 
 ROOT = Path('/var/lib/whalenode-installer')
 CONF = Path('/etc/whalenode')
+UNIT = Path('/etc/systemd/system/whalenode.service')
 PROTOCOLS = {'vless': ('vless', 28443), 'hy2': ('hysteria', 24443), 'anytls': ('anytls', 30443)}
 
 def run(*args, check=True):
@@ -137,6 +138,7 @@ def parser():
     p.add_argument('--non-interactive', action='store_true', help='禁止交互，缺少参数时直接报错')
     p.add_argument('--release-manifest', help='HTTPS 发布清单，自动选择架构及校验值')
     mode.add_argument('--rollback', action='store_true', help='停止本任务服务并恢复本任务修改的系统参数；保留隐藏面板节点')
+    mode.add_argument('--retune', action='store_true', help='升级 CPU/内存后执行：按当前配置重算后端 CPU/内存上限与内核参数，修正网卡队列算法（上限变化时重启后端数秒）')
     mode.add_argument('--hide', action='store_true', help='面板隐藏本机节点（用户不再收到）')
     mode.add_argument('--show', action='store_true', help='面板重新显示本机节点')
     mode.add_argument('--uninstall', action='store_true', help='隐藏并删除面板节点，卸载本机服务和监控')
@@ -271,7 +273,7 @@ def choose_sni(used,tls13=False):
 
 def dependency_check():
     if not Path('/run/systemd/system').is_dir():raise RuntimeError('需要使用 systemd 的服务器')
-    needed=('nft','ss','sysctl','modprobe','useradd','runuser')
+    needed=('nft','ss','tc','sysctl','modprobe','useradd','runuser')
     if all(shutil.which(x) for x in needed):return
     print('正在安装缺少的运行依赖…',flush=True)
     if shutil.which('apt-get'):
@@ -363,6 +365,74 @@ def verify_service(state):
     report=diagnose(state)
     failed=[item['label'] for item in report['checks'] if not item['passed']]
     if failed:raise RuntimeError('本机验收失败：'+'；'.join(failed))
+
+def tune_kernel(facts):
+    """Conservative, resource-bounded settings; never rewrite driver IRQ or offload blindly.
+
+    The queueing discipline must be fq_codel, not fq: a sing hysteria2 inbound is a single UDP
+    socket, and fq treats a socket as one flow with a 100-packet flow_limit, so under load it
+    dropped the machine's entire HY2 traffic (fleet finding 2026-09-16; v0.3.4 and earlier set fq).
+    Returns the default-route device and its qdisc after the change."""
+    settings={'net.core.somaxconn':8192,'net.core.rmem_max':facts['socket_buffer'],'net.core.wmem_max':facts['socket_buffer'],'net.ipv4.tcp_mtu_probing':1,'net.core.default_qdisc':'fq_codel'}
+    old=json.loads((ROOT/'sysctl-before.json').read_text()) if (ROOT/'sysctl-before.json').exists() else {}
+    for k in settings:
+        if k not in old: old[k]=run('sysctl','-n',k).stdout.strip()
+    run('modprobe','tcp_bbr',check=False)
+    if 'bbr' in run('sysctl','-n','net.ipv4.tcp_available_congestion_control').stdout.split():
+        if 'net.ipv4.tcp_congestion_control' not in old:old['net.ipv4.tcp_congestion_control']=run('sysctl','-n','net.ipv4.tcp_congestion_control').stdout.strip()
+        settings['net.ipv4.tcp_congestion_control']='bbr'
+    atomic(ROOT/'sysctl-before.json',json.dumps(old))
+    atomic('/etc/sysctl.d/90-whalenode.conf',''.join(str(k)+'='+str(v)+'\n' for k,v in settings.items()),0o644)
+    run('sysctl','-p','/etc/sysctl.d/90-whalenode.conf')
+    # default_qdisc only applies to qdiscs created later. Replace an fq root (or the fq children of
+    # an mq root) on the default-route device now; any other discipline someone chose is left alone.
+    route=run('ip','-4','route','show','default',check=False).stdout.split()
+    dev=route[route.index('dev')+1] if 'dev' in route[:-1] else ''
+    if not dev or not shutil.which('tc'):return dev,''
+    shown=run('tc','qdisc','show','dev',dev,check=False).stdout
+    if re.search(r'^qdisc fq ',shown,re.M):
+        if shown.startswith('qdisc mq'):run('tc','qdisc','replace','dev',dev,'root','handle','1:','mq',check=False)
+        else:run('tc','qdisc','replace','dev',dev,'root','fq_codel',check=False)
+        shown=run('tc','qdisc','show','dev',dev,check=False).stdout
+    return dev,shown
+
+def wait_listening(selected):
+    missing=selected[:]
+    for _ in range(36):
+        missing=[]
+        for proto in selected:
+            sock='-lun' if proto=='hy2' else '-ltn'
+            if len(run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines())<2:missing.append(proto)
+        if not missing:break
+        time.sleep(5)
+    return missing
+
+def retune(state):
+    """After a CPU/memory upgrade: GOMAXPROCS, GOMEMLIMIT and socket buffers were fixed at install time,
+    so an upgraded machine kept using the old core count. Recompute from the current machine, fix the
+    qdisc, and restart the backend only if its limits changed."""
+    if state.get('phase') not in ('installed','published') or not state.get('owns_service'):
+        raise RuntimeError('本机没有由本安装器装好的 WhaleNode，无需 --retune')
+    facts=resources()
+    dev,shown=tune_kernel(facts)
+    unit=UNIT
+    text=unit.read_text()
+    new=re.sub(r'GOMEMLIMIT=\d+MiB','GOMEMLIMIT='+str(facts['go_memory_mib'])+'MiB',text)
+    new=re.sub(r'GOMAXPROCS=\d+','GOMAXPROCS='+str(facts['cpus']),new)
+    before=state.get('resources') or {}
+    if new!=text:
+        atomic(unit,new,0o644)
+        run('systemctl','daemon-reload')
+        print('后端 CPU/内存上限已变化，重启 whalenode（连接会断开几秒）…',flush=True)
+        run('systemctl','restart','whalenode.service')
+        missing=wait_listening(state.get('protocols') or [])
+        if missing:raise RuntimeError('重启后监听未就绪，协议：'+','.join(missing)+'；使用 journalctl -u whalenode 检查')
+        verify_service(state)
+    state['resources']=facts;save_state(state)
+    qd=' '.join(sorted(set(re.findall(r'^qdisc (\S+)',shown,re.M)))) or '未知'
+    print('已按当前配置调整：CPU %s→%s 核，内存上限 %s→%s MiB，套接字缓冲 %s 字节，网卡 %s 队列算法 %s%s'%(
+        before.get('cpus','?'),facts['cpus'],before.get('go_memory_mib','?'),facts['go_memory_mib'],facts['socket_buffer'],
+        dev or '?',qd,'' if new!=text else '（后端上限未变，未重启）'))
 
 
 def rows(response):
@@ -556,6 +626,8 @@ def main(argv=None):
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     if args.rollback:
         rollback(state);return
+    if args.retune:
+        retune(state);return
     if args.hide or args.show or args.uninstall:
         manage(args,state);return
     def wanted(value):
@@ -752,20 +824,7 @@ def main(argv=None):
         state['owns_egress']=True;save('egress')
         run('nft','-f',str(nft))
     atomic('/etc/systemd/system/whalenode-egress.service','[Unit]\nBefore=whalenode.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/whalenode-egress.nft\nExecStop=/usr/sbin/nft delete table inet whalenode_egress\n[Install]\nWantedBy=multi-user.target\n',0o644)
-    # Conservative, resource-bounded settings; never rewrite driver IRQ or offload blindly.
-    settings={'net.core.somaxconn':8192,'net.core.rmem_max':facts['socket_buffer'],'net.core.wmem_max':facts['socket_buffer'],'net.ipv4.tcp_mtu_probing':1}
-    old=json.loads((ROOT/'sysctl-before.json').read_text()) if (ROOT/'sysctl-before.json').exists() else {}
-    for k in settings:
-        if k not in old: old[k]=run('sysctl','-n',k).stdout.strip()
-    atomic(ROOT/'sysctl-before.json',json.dumps(old))
-    run('modprobe','tcp_bbr',check=False)
-    if 'bbr' in run('sysctl','-n','net.ipv4.tcp_available_congestion_control').stdout.split():
-        for k,v in {'net.ipv4.tcp_congestion_control':'bbr','net.core.default_qdisc':'fq'}.items():
-            if k not in old: old[k]=run('sysctl','-n',k).stdout.strip()
-            settings[k]=v
-    atomic(ROOT/'sysctl-before.json',json.dumps(old))
-    atomic('/etc/sysctl.d/90-whalenode.conf',''.join(str(k)+'='+str(v)+'\n' for k,v in settings.items()),0o644)
-    run('sysctl','-p','/etc/sysctl.d/90-whalenode.conf')
+    tune_kernel(facts)
     unit='[Unit]\nDescription=WhaleNode\nAfter=network-online.target whalenode-egress.service\nRequires=whalenode-egress.service\nWants=network-online.target\n[Service]\nUser=whalenode\nGroup=whalenode\nWorkingDirectory='+str(CONF)+'\nUMask=0077\nEnvironment=GOMEMLIMIT='+str(facts['go_memory_mib'])+'MiB\nEnvironment=GOMAXPROCS='+str(facts['cpus'])+'\nExecStart='+str(binary)+' server -c '+str(CONF/'config.json')+'\nRestart=always\nRestartSec=5\nLimitNOFILE=262144\nNoNewPrivileges=true\nProtectHome=true\nProtectSystem=strict\nReadWritePaths='+str(CONF)+'\n[Install]\nWantedBy=multi-user.target\n'
     atomic('/etc/systemd/system/whalenode.service',unit,0o644)
     state['owns_service']=True;save('configured')
@@ -776,14 +835,7 @@ def main(argv=None):
     run('systemctl','enable','--now','whalenode-egress.service')
     save('starting')
     run('systemctl','enable','--now','whalenode.service')
-    missing=selected[:]
-    for _ in range(36):
-        missing=[]
-        for proto in selected:
-            sock='-lun' if proto=='hy2' else '-ltn'
-            if len(run('ss',sock,'sport = :'+str(PROTOCOLS[proto][1])).stdout.splitlines())<2:missing.append(proto)
-        if not missing:break
-        time.sleep(5)
+    missing=wait_listening(selected)
     if missing:
         run('systemctl','stop','whalenode.service',check=False)
         raise RuntimeError('后端监听未就绪，已停止失败服务，协议：'+','.join(missing)+'；使用 journalctl -u whalenode 检查后可原命令续跑')

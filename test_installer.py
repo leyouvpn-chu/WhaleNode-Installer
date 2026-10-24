@@ -297,4 +297,63 @@ class PanelLifecycleTests(unittest.TestCase):
             args=i.parser().parse_args(['--download-token','abc','--download-token-file',str(path)])
             with self.assertRaises(ValueError):i.prepare_download_auth(args)
 
+    def _kernel(self, qdiscs):
+        """Run tune_kernel against fake sysctl/ip/tc; qdiscs = successive `tc qdisc show` outputs."""
+        calls=[];written={};shows=list(qdiscs)
+        def fake_run(*a,check=True):
+            calls.append(a)
+            out=''
+            if a[:2]==('sysctl','-n'):out='reno cubic bbr' if a[2].endswith('available_congestion_control') else '1'
+            elif a[:2]==('ip','-4'):out='default via 192.0.2.1 dev eth0 proto static onlink'
+            elif a[:3]==('tc','qdisc','show'):out=shows.pop(0) if shows else ''
+            return type('R',(),{'returncode':0,'stdout':out})()
+        with tempfile.TemporaryDirectory() as d,patch.object(i,'ROOT',Path(d)),patch.object(i,'run',side_effect=fake_run),\
+             patch.object(i,'atomic',side_effect=lambda p,t,m=0o600:written.__setitem__(str(p),t)),patch.object(i.shutil,'which',return_value='/usr/sbin/tc'):
+            result=i.tune_kernel({'socket_buffer':8388608})
+        return calls,written,result
+    def test_kernel_tuning_uses_fq_codel_and_replaces_an_fq_root(self):
+        calls,written,(dev,shown)=self._kernel(['qdisc fq 8001: root refcnt 2 limit 10000p flow_limit 100p','qdisc fq_codel 8002: root refcnt 2'])
+        conf=written['/etc/sysctl.d/90-whalenode.conf']
+        self.assertIn('net.core.default_qdisc=fq_codel\n',conf)
+        self.assertNotIn('default_qdisc=fq\n',conf)
+        self.assertIn(('tc','qdisc','replace','dev','eth0','root','fq_codel'),calls)
+        self.assertEqual((dev,shown.split()[1]),('eth0','fq_codel'))
+    def test_kernel_tuning_rebuilds_mq_so_children_take_fq_codel(self):
+        calls,_,_=self._kernel(['qdisc mq 0: root\nqdisc fq 0: parent :1 limit 10000p\nqdisc fq 0: parent :2 limit 10000p','qdisc mq 1: root\nqdisc fq_codel 0: parent 1:1'])
+        self.assertIn(('tc','qdisc','replace','dev','eth0','root','handle','1:','mq'),calls)
+    def test_kernel_tuning_leaves_other_disciplines_alone(self):
+        calls,_,_=self._kernel(['qdisc cake 8001: root refcnt 2 bandwidth unlimited'])
+        self.assertFalse([c for c in calls if c[:3]==('tc','qdisc','replace')])
+    def test_install_path_has_no_fq_left(self):
+        src=Path(i.__file__).read_text(encoding='utf-8')
+        self.assertNotIn("'net.core.default_qdisc':'fq'}",src)
+        self.assertNotIn("default_qdisc':'fq'",src.replace("default_qdisc':'fq_codel'",''))
+    def _retune(self,unit_text,facts,state=None):
+        calls=[]
+        state=state or {'phase':'published','owns_service':True,'protocols':['vless','hy2'],'resources':{'cpus':2,'go_memory_mib':2000}}
+        with tempfile.TemporaryDirectory() as d:
+            unit=Path(d)/'whalenode.service';unit.write_text(unit_text)
+            with patch.object(i,'ROOT',Path(d)),patch.object(i,'UNIT',unit),patch.object(i,'resources',return_value=facts),\
+                 patch.object(i,'tune_kernel',return_value=('eth0','qdisc fq_codel 1: root')),patch.object(i,'wait_listening',return_value=[]),\
+                 patch.object(i,'verify_service'),patch.object(i,'run',side_effect=lambda *a,check=True:calls.append(a) or type('R',(),{'returncode':0,'stdout':''})()),\
+                 patch('sys.stdout',new_callable=io.StringIO):
+                i.retune(state)
+            return unit.read_text(),calls,json.loads((Path(d)/'state.json').read_text())
+    def test_retune_after_upgrade_raises_limits_and_restarts(self):
+        text,calls,saved=self._retune('Environment=GOMEMLIMIT=2000MiB\nEnvironment=GOMAXPROCS=2\n',
+                                      {'cpus':8,'go_memory_mib':9216,'socket_buffer':16777216,'memory_mib':15974})
+        self.assertIn('GOMAXPROCS=8\n',text);self.assertIn('GOMEMLIMIT=9216MiB\n',text)
+        self.assertIn(('systemctl','restart','whalenode.service'),calls)
+        self.assertEqual(saved['resources']['cpus'],8)
+    def test_retune_without_change_does_not_restart(self):
+        _,calls,_=self._retune('Environment=GOMEMLIMIT=9216MiB\nEnvironment=GOMAXPROCS=8\n',
+                               {'cpus':8,'go_memory_mib':9216,'socket_buffer':16777216,'memory_mib':15974})
+        self.assertNotIn(('systemctl','restart','whalenode.service'),calls)
+    def test_retune_refuses_machines_it_did_not_install(self):
+        with self.assertRaises(RuntimeError):
+            self._retune('x',{'cpus':1,'go_memory_mib':1,'socket_buffer':1,'memory_mib':1},state={'phase':'configured'})
+    def test_retune_is_a_mode(self):
+        self.assertTrue(i.parser().parse_args(['--retune']).retune)
+        with self.assertRaises(SystemExit),patch('sys.stderr',new_callable=io.StringIO):i.parser().parse_args(['--retune','--rollback'])
+
 if __name__=='__main__':unittest.main()

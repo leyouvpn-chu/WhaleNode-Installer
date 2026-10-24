@@ -7,7 +7,7 @@
 以 root 登录，用下面这一整行启动安装，**不要追加 `--help`**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.4/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.5/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
 ```
 
 下载地址不能直接作为 shell 命令执行。下载和执行必须使用同一个文件名。`--help` 只显示帮助，不会安装。
@@ -72,6 +72,7 @@ bash /root/whalenode-install.sh \
 | 导出脱敏验收报告 | `bash /root/whalenode-install.sh --check --report-file /root/whalenode-report.json` |
 | 失败后续跑 | `bash /root/whalenode-install.sh` |
 | 回滚本任务本机变更 | `bash /root/whalenode-install.sh --rollback` |
+| 升级 CPU/内存后重新调参 | `bash /root/whalenode-install.sh --retune` |
 
 配置与节点 ID 保存在 `/var/lib/whalenode-installer/state.json`，目录权限 0700、文件 0600。名称、协议、面板地址、下载版本、组和路由会记忆，已创建节点不会因正常续跑重复创建。已完成任务再次运行会核验正在运行的文件和出口规则，不重复安装。
 
@@ -162,6 +163,8 @@ bash /root/whalenode-install.sh --status
 分享日志前先遮盖后台地址和敏感字段。常见原因包括管理员权限/管理路径错误、下载链接过期、制品哈希错误、端口已被其他服务占用、候选 SNI 不可达。
 
 脚本拒绝接管未知配置和现有代理服务。面板写请求遇到超时不会立即重复提交，下次按持久任务标签核对记录。不要通过删除状态文件“重试”，否则会丢失关联和回滚依据。
+
+`--retune` 用于云主机升级配置之后：v0.3.4 及以前把后端可用 CPU 核数（GOMAXPROCS）、内存上限（GOMEMLIMIT）和套接字缓冲按安装时的配置写死，升级后仍按旧配置运行；同时旧版把网卡队列设成 `fq`，会把 HY2 单个 UDP 套接字的全部流量当成一条流限到 100 个包。`--retune` 按当前配置重算这些值、把 `fq` 换成 `fq_codel`，上限有变化时重启后端（断线几秒）。
 
 `--rollback` 停止并禁用本任务服务，移除本任务 nftables 表和配置文件、恢复记录的 sysctl。它会中断该节点流量；保留本机密钥配置、任务状态、已下载制品和面板行，以便续跑。不是彻底卸载；彻底移除用 `--uninstall`。
 

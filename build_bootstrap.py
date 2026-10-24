@@ -41,6 +41,8 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --check                只读检查服务、端口、配置权限及 IPv6 出口规则
   --report-file 文件      配合 --check 导出脱敏 JSON 报告（必须是新文件）
   --rollback             停止本任务服务，恢复本任务修改的系统参数
+  --retune               升级 CPU/内存后执行：按当前配置重算后端 CPU/内存上限和内核参数，
+                         修正网卡队列算法（上限变化时重启后端，断线几秒）
   --node-group 分组       网关节点分组，默认 legacy_all（Whale + 旧 Super 共用）
   --no-publish           安装后保持面板隐藏（默认直接显示）
   --hide / --show        面板隐藏 / 重新显示本机节点
