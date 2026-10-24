@@ -207,6 +207,50 @@ class BootstrapTests(unittest.TestCase):
                 self.assertEqual(i.choose_sni(set(),tls13=True),'www.oracle.com')
                 self.assertEqual(i.choose_sni({'www.php.net'}),'www.oracle.com')
             self.assertGreaterEqual(len(i.SNI_POOL),60)
+    def test_sni_usage_counts_rows_without_double_counting(self):
+        counts=i.sni_usage([
+            {'server_name':'A.TEST.', 'tls_settings':{'server_name':'a.test'}},
+            {'server_name':'a.test','show':0},
+            {'tls_settings':{'server_name':'b.test'}},
+            {'server_name':None,'tls_settings':None}])
+        self.assertEqual(counts,{'a.test':2,'b.test':1})
+
+    def test_sni_reuse_order_and_failed_unused_fallback(self):
+        from unittest.mock import MagicMock
+        sock=MagicMock()
+        ctx=MagicMock()
+        ctx.wrap_socket.return_value.__enter__.return_value.version.return_value='TLSv1.3'
+        pool=('busy.test','light.test','unused.test')
+        def connect(addr,timeout):
+            if addr[0]=='unused.test':raise OSError('unreachable')
+            return sock
+        with patch.object(i,'SNI_POOL',pool),patch.object(i.socket,'create_connection',side_effect=connect) as conn,patch.object(i.ssl,'create_default_context',return_value=ctx):
+            self.assertEqual(i.choose_sni({'busy.test':9,'light.test':2},tls13=True),'light.test')
+            self.assertEqual([call.args[0][0] for call in conn.call_args_list],['unused.test','light.test'])
+            conn.reset_mock()
+            self.assertEqual(i.choose_sni({'busy.test':9,'light.test':2,'unused.test':5}),'light.test')
+            self.assertEqual(conn.call_count,1)
+
+    def test_sni_reused_domain_still_requires_tls13(self):
+        from unittest.mock import MagicMock
+        ctx=MagicMock()
+        ctx.wrap_socket.return_value.__enter__.return_value.version.return_value='TLSv1.2'
+        with patch.object(i,'SNI_POOL',('a.test',)),patch.object(i.socket,'create_connection',return_value=MagicMock()),patch.object(i.ssl,'create_default_context',return_value=ctx):
+            with self.assertRaisesRegex(RuntimeError,'TLS版本不满足要求=1'):
+                i.choose_sni({'a.test':3},tls13=True)
+
+    def test_sni_certificate_failure_is_reported(self):
+        from unittest.mock import MagicMock
+        ctx=MagicMock()
+        ctx.wrap_socket.side_effect=i.ssl.SSLCertVerificationError('bad certificate')
+        with patch.object(i,'SNI_POOL',('a.test',)),patch.object(i.socket,'create_connection',return_value=MagicMock()),patch.object(i.ssl,'create_default_context',return_value=ctx):
+            with self.assertRaisesRegex(RuntimeError,'证书验证失败=1'):
+                i.choose_sni({'a.test':1})
+
+    def test_sni_pool_unique_and_expanded(self):
+        self.assertEqual(len(i.SNI_POOL),len(set(i.SNI_POOL)))
+        self.assertGreaterEqual(len(i.SNI_POOL),128)
+
     def test_public_address_lookup_forces_ipv4(self):
         seen=[]
         def fake_request(url,token=None,data=None):
@@ -278,7 +322,7 @@ class PanelLifecycleTests(unittest.TestCase):
             from types import SimpleNamespace
             return SimpleNamespace(stdout='',returncode=0)
         with tempfile.TemporaryDirectory() as d,patch.object(i,'ROOT',Path(d)/'state'),patch.object(i,'CONF',Path(d)/'conf'),\
-             patch.object(i,'request',side_effect=request),patch.object(i,'run',side_effect=run),patch.object(i.shutil,'rmtree'),\
+             patch.object(i,'request',side_effect=request),patch.object(i,'run',side_effect=run),patch.object(i.shutil,'rmtree'),patch.object(Path,'unlink'),\
              patch('sys.stdout',new_callable=io.StringIO):
             (Path(d)/'state').mkdir()
             i.uninstall(args,state)

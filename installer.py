@@ -1,5 +1,6 @@
 """WhaleNode 服务器本机安装器，仅依赖 Python 标准库。"""
 import argparse
+from collections import Counter
 import fcntl
 import getpass
 import gzip
@@ -257,19 +258,57 @@ SNI_POOL=(
     'www.micron.com','www.juniper.net','www.arista.com','www.netapp.com','www.citrix.com','www.apache.org',
     'www.php.net','www.rust-lang.org','www.thalesgroup.com','www.continental.com','www.olympus-global.com',
     'www.yamaha.com','www.denso.com',
+    # Additional candidates; verified on the installing host, not assumed reachable.
+    'www.microsoft.com','www.apple.com','www.cloudflare.com','www.mozilla.org',
+    'www.wikipedia.org','www.wikimedia.org','www.ubuntu.com','www.opensuse.org',
+    'www.freebsd.org','www.openbsd.org','www.netbsd.org','www.alpinelinux.org',
+    'www.docker.com','www.hashicorp.com','www.gitlab.com','github.com',
+    'www.digitalocean.com','www.linode.com','www.akamai.com','www.fastly.com',
+    'www.f5.com','www.fortinet.com','www.paloaltonetworks.com','www.checkpoint.com',
+    'www.broadcom.com','www.marvell.com','www.amd.com','www.nvidia.com',
+    'www.ti.com','www.analog.com','www.microchip.com','www.onsemi.com',
+    'www.renesas.com','www.rohm.com','www.murata.com','www.tdk.com',
+    'www.keysight.com','www.tek.com','www.fluke.com','www.ni.com',
+    'www.honeywell.com','www.emerson.com','www.eaton.com','www.se.com',
+    'www.danfoss.com','www.grundfos.com','www.skf.com','www.sandvik.com',
+    'www.volvo.com','www.scania.com','www.man.eu','www.mercedes-benz.com',
+    'www.audi.com','www.porsche.com','www.toyota.com','www.honda.com',
+    'www.nissan-global.com','www.mazda.com','www.subaru.com','www.suzuki.com',
+    'www.lego.com','www.ikea.com','www.hilton.com','www.marriott.com',
 )
 
+def sni_usage(nodes):
+    counts=Counter()
+    for node in nodes:
+        tls=node.get('tls_settings')
+        names={node.get('server_name'),tls.get('server_name') if isinstance(tls,dict) else None}
+        # The same domain in both fields of one row counts once; hidden rows count too.
+        counts.update({name.lower().rstrip('.') for name in names if isinstance(name,str) and name})
+    return counts
+
+
 def choose_sni(used,tls13=False):
-    # 随机顺序：全队挑同一个 SNI 等于给封锁方一个聚类特征。
-    for host in secrets.SystemRandom().sample(SNI_POOL,len(SNI_POOL)):
-        if host in used:continue
+    counts=Counter(used)
+    # Shuffle ties, then prefer unused / least-used domains. Reuse still requires TLS.
+    candidates=secrets.SystemRandom().sample(SNI_POOL,len(SNI_POOL))
+    candidates.sort(key=lambda host:counts[host])
+    failures=Counter()
+    for host in candidates:
         try:
             with socket.create_connection((host,443),timeout=5) as sock:
                 with ssl.create_default_context().wrap_socket(sock,server_hostname=host) as tls:
-                    # REALITY 借用目标站握手，必须支持 TLS 1.3。
-                    if tls.version() and (not tls13 or tls.version()=='TLSv1.3'):return host
-        except OSError:continue
-    raise RuntimeError('自动 SNI 测试没有通过，请通过 --sni 指定已验证域名')
+                    version=tls.version()
+                    if not version or (tls13 and version!='TLSv1.3'):
+                        failures['TLS版本不满足要求']+=1
+                        continue
+                    if counts[host]:
+                        print('自动 SNI 复用：'+host+'（面板/本次已使用 '+str(counts[host])+' 次，TLS 验证通过）',flush=True)
+                    return host
+        except ssl.SSLCertVerificationError:failures['证书验证失败']+=1
+        except ssl.SSLError:failures['TLS握手失败']+=1
+        except OSError:failures['DNS/连接失败']+=1
+    detail='、'.join(k+'='+str(v) for k,v in failures.items())
+    raise RuntimeError('自动 SNI 测试没有通过（已测试 '+str(len(candidates))+' 个候选，允许复用；'+detail+'），请检查网络/系统时间/CA，或通过 --sni 指定已验证域名')
 
 def dependency_check():
     if not Path('/run/systemd/system').is_dir():raise RuntimeError('需要使用 systemd 的服务器')
@@ -734,14 +773,11 @@ def main(argv=None):
             raise RuntimeError('所需端口已被占用，协议：'+proto)
     all_nodes = rows(request(state['admin_url']+'/server/manage/getNodes',admin))
     state.setdefault('snis',{})
-    used={str(x.get('server_name','')) for x in all_nodes}
-    for x in all_nodes:
-        tls=x.get('tls_settings')
-        if isinstance(tls,dict):used.add(tls.get('server_name',''))
+    used=sni_usage(all_nodes)
     for proto in selected:
         if proto not in state['snis']:
             state['snis'][proto]=state.get('sni') or choose_sni(used,tls13=proto=='vless')
-            used.add(state['snis'][proto]);save('preflight')
+            used[state['snis'][proto].lower().rstrip('.')]+=1;save('preflight')
     print('后台连接通过；正在校验后端发布包…',flush=True)
     releases = Path('/opt/whalenode/releases'); releases.mkdir(parents=True,exist_ok=True)
     releases.parent.chmod(0o755);releases.chmod(0o755)

@@ -19,7 +19,7 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --binary-url 地址       手动指定 gzip 发布包（与下面两项配套）
   --binary-sha256 校验值  解压后可执行文件的 SHA256
   --source-commit 提交号  发布包对应的完整 40 位源码提交号
-  --sni 域名              可选；默认从未复用候选域名中测试选择
+  --sni 域名              可选；优先未用域名，不足时按使用次数择少复用，均测试 TLS
 
 敏感参数（省略后隐藏输入，不在终端显示）：
   --api-key 密钥          节点 API 密钥
