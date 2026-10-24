@@ -247,6 +247,18 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'证书验证失败=1'):
                 i.choose_sni({'a.test':1})
 
+    def test_import_pool_rejects_stale_and_unverified_results(self):
+        from import_sni_pool import select
+        import datetime
+        row=dict(domain='new.test',accepted=True,ok=True,certificate_verified=True,tls13=True,alpn_h2=True,x25519=True,chain_bytes=2000,redirect=False)
+        doc=dict(finished=datetime.datetime.now(datetime.timezone.utc).isoformat(),results=[row])
+        self.assertEqual(select(doc),['new.test'])
+        row['certificate_verified']=False
+        with self.assertRaises(ValueError):select(doc)
+        row['certificate_verified']=True
+        doc['finished']='2026-01-01T00:00:00+00:00'
+        with self.assertRaises(ValueError):select(doc)
+
     def test_sni_pool_unique_and_expanded(self):
         self.assertEqual(len(i.SNI_POOL),len(set(i.SNI_POOL)))
         self.assertGreaterEqual(len(i.SNI_POOL),128)
