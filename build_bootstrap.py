@@ -1,5 +1,7 @@
 """Generate the single-file shell entry; no dependencies or compilation."""
 from pathlib import Path
+import base64
+import json
 root=Path(__file__).resolve().parent
 prefix='''#!/usr/bin/env bash
 set -euo pipefail
@@ -44,6 +46,10 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --retune               升级 CPU/内存后执行：按当前配置重算后端 CPU/内存上限和内核参数，
                          修正网卡队列算法（上限变化时重启后端，断线几秒）
   --node-group 分组       网关节点分组，默认 legacy_all（Whale + 旧 Super 共用）
+  --ip-pool status       公网 IP 池状态（开发版：操作仅生成计划）
+  --ip-pool scan         绑定各源地址核验公网出口
+  --ip-pool lock IP      锁定地址，自动任务不得修改
+  --ip-pool install-watch 开机与每五分钟扫描；不自动发布
   --no-publish           安装后保持面板隐藏（默认直接显示）
   --hide / --show        面板隐藏 / 重新显示本机节点
   --uninstall [--yes]    隐藏并删除面板节点，卸载本机 WhaleNode 与监控
@@ -83,4 +89,16 @@ fi
 python3 -c 'import sys; assert sys.version_info >= (3,9), "需要 Python 3.9 或更新版本"'
 exec python3 - "$@" <<'WHALE_INSTALLER_PY'
 '''
-(root/'install.sh').write_text(prefix+(root/'installer.py').read_text(encoding='utf-8')+'\nWHALE_INSTALLER_PY\n',encoding='utf-8',newline='\n')
+files={name:base64.b64encode((root/name).read_bytes()).decode() for name in
+       ('installer.py','ip_pool.py','ip_pool_cli.py','ip_pool_transaction.py')}
+loader='''# Embedded IP management modules are unpacked only for the IP-pool command.
+import sys as _sys
+if _sys.argv[1:2] == ['--ip-pool']:
+    import tempfile as _tempfile, pathlib as _pathlib, base64 as _base64, atexit as _atexit
+    _bundle = _tempfile.TemporaryDirectory(prefix='whalenode-ip-pool-')
+    _atexit.register(_bundle.cleanup)
+    for _name, _data in '''+repr(files)+'''.items():
+        _pathlib.Path(_bundle.name, _name).write_bytes(_base64.b64decode(_data))
+    _sys.path.insert(0, _bundle.name)
+'''
+(root/'install.sh').write_text(prefix+loader+(root/'installer.py').read_text(encoding='utf-8')+'\nWHALE_INSTALLER_PY\n',encoding='utf-8',newline='\n')

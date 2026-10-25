@@ -1157,7 +1157,11 @@ def finish(args,state,admin=None):
     print('管理：再次运行本脚本可选择 面板隐藏 / 重新显示 / 卸载；或直接用 --hide、--show、--uninstall。')
 
 if __name__=='__main__':
-    try:main()
+    try:
+        if sys.argv[1:2]==['--ip-pool']:
+            import ip_pool_cli
+            ip_pool_cli.main(sys.argv[2:])
+        else:main()
     except (Exception,KeyboardInterrupt) as e:
         # Do not emit exception URLs, request bodies, credentials or stack locals.
         print('操作未完成：'+(str(e) if isinstance(e,(RuntimeError,ValueError)) else type(e).__name__),file=sys.stderr)

@@ -1,5 +1,11 @@
 # WhaleNode 一键安装器
 
+> 当前开发分支包含公网 IP 池候选功能，尚未发布。`--ip-pool` 的启停、替换操作目前只保存计划，输出 `applied=false`；生产执行适配器尚未接通，不能用于宣称自动搭建或自动换 IP 已完成。原单 IP 安装流程保持独立。
+
+开发分支可用入口：`bash install.sh --ip-pool status`、`scan`、`history`、`lock IP`、`unlock IP`、`pause`、`resume`、`enable IP`、`disable IP`、`replace OLD_IP NEW_IP`。`install-watch` 安装开机与定时**发现**任务，`stop-watch` 停止后续定时发现；两者均不自动更改面板。私网、CGNAT、网卡未绑定或出口验证不符的地址不能进入启用计划。
+
+多 IP 实例配置生成与源站对账候选文件分别位于 `ip_pool_runtime.py`、`server/whalenode_enroll_sync.py`。尚待服务器限定权限的执行通道、旧服务迁移、调度容量共享和真实多公网 IP 验收。不要直接替换生产源站对账脚本。
+
 在 Linux 新服务器的 SSH 终端执行，进入中文安装向导。默认创建 **VLESS（REALITY）+ Hysteria2**，也可选择 AnyTLS。脚本公开；后台地址、密钥和后端制品由运营方在安装时提供，不内置在仓库中。
 
 ## 新服务器怎么执行
