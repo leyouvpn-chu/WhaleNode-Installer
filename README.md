@@ -1,5 +1,61 @@
 # WhaleNode 一键安装器
 
+## 统一中文菜单：新旧服务器共用入口
+
+下载并运行已验证的固定版本，输入数字选择操作：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/7ff7843d44ac2531183ab3008ddd8bc0db9f5e0c/install.sh -o /root/whale-manager.sh && bash /root/whale-manager.sh
+```
+
+```text
+1 安装节点 / 继续未完成的安装
+2 查看节点与监控状态
+3 扫描网卡公网 IP
+4 公网 IP 与开机扫描管理
+5 隐藏 / 恢复原节点
+6 本机诊断
+7 按当前 CPU/内存重新调参
+8 卸载原安装器节点
+0 退出
+```
+
+以后运行 `bash /root/whale-manager.sh` 返回菜单。通过 SSH 交互终端以 root 运行，需要 Python 3.9+；公网扫描还需要 iproute2、curl 和 CA 证书。菜单入口不会自动补装这些依赖。
+
+### 运维带参数入口
+
+**上面的公开下载命令不含 API Key、管理员令牌或下载授权。** 运维应使用运营方私下提供的完整命令，或将下列模板中的占位值替换为实际配置。带上 `--menu` 后仍进入统一菜单，选择 1 时使用传入的配置；不要把真实凭据提交到公开仓库。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/7ff7843d44ac2531183ab3008ddd8bc0db9f5e0c/install.sh -o /root/whale-manager.sh && \
+bash /root/whale-manager.sh --menu \
+  --api-url 'https://节点API地址' \
+  --admin-url 'https://面板地址/api/v1/管理路径' \
+  --release-manifest 'https://下载地址/manifest.json' \
+  --api-key '替换为节点API密钥' \
+  --admin-token '替换为管理员授权值' \
+  --download-token '替换为私有下载令牌' \
+  --protocols vless,hy2 --group-ids 1 --node-group legacy_all
+```
+
+组 ID 和节点分组需符合实际部署。下载服务不需要令牌时可省略 `--download-token`。命令中的明文凭据可能进入 shell 历史和进程参数；也可分别使用 `--api-key-file`、`--admin-token-file`、`--download-token-file` 指向 root 所有、权限 0600 的凭据文件。菜单退出后管理员令牌不会保存，下次执行面板操作仍需使用带参数命令或重新输入。已经保存的节点配置可按安装阶段复用，不能保证全新服务器免输入所有设置。
+
+### 旧服务器扫描与新增、更换 IP
+
+旧机器即使没有 `/opt/whalenode/ip-pool/ip_pool_cli.py`，也能下载上面的单文件脚本，选择 **3** 扫描，无需面板凭据或重装节点。已有未知服务不会被自动接管。
+
+扫描仅纳入网卡已绑定的公网 **IPv4**，排除私网、回环、链路本地和 CGNAT 地址；逐 IP 绑定源地址访问两个 HTTPS 回显站点，核对实际出口。扫描通过不等于协议可用或节点已创建。
+
+运营商新增或更换 IP 后，先按运营商网络配置绑定新地址，再选择 3 验证。脚本不能从运营商账户自动获取或猜测未绑定的地址。确认新节点配置、面板与分组、订阅以及实际传输都正常后，再撤下旧入口。
+
+菜单 **4** 支持刷新 IP 池、查看记录、人工锁定/解锁，以及开启/关闭开机和每五分钟扫描。定时任务只发现、验证和保存计划；**通用批量建节点、自动替换 IP、外部探针自动切换尚未接通**。锁定用于约束后续计划，不会立即改变运行节点。CLI 的 `--ip-pool` 计划操作显示 `applied=false`，不能视为已经上线。
+
+菜单 2 只显示本机节点、监控服务和定时器状态，不代表集中监控已有新数据或客户端连接成功。菜单 5 只管理原安装器记录的节点；检测到附加 IP 实例时，旧卸载和回滚会被阻止，避免删除共用文件。
+
+菜单版本源码见 [统一菜单分支](https://github.com/leyouvpn-chu/WhaleNode-Installer/tree/feat/unified-node-menu-20261026)。该版本通过 109 项远端检查及实机菜单扫描测试；未为测试而重跑生产安装、发布和卸载。这里提供固定版本入口，下面保留旧版安装器的参数和运维参考，旧版菜单编号不适用于新版。
+
+## 旧版 v0.3.5 安装入口与通用参数参考
+
 在 Linux 新服务器的 SSH 终端执行，进入中文安装向导。默认创建 **VLESS（REALITY）+ Hysteria2**，也可选择 AnyTLS。脚本公开；后台地址、密钥和后端制品由运营方在安装时提供，不内置在仓库中。
 
 ## 新服务器怎么执行
@@ -34,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0
 
 **默认安装后直接显示，不做外部可用性测试。** 面板显示后，运营方源站的对账任务（每分钟）会自动完成调度容量登记、网关节点分组和 Zabbix/Grafana 监控清单，完成后安装器提示“源站接入完成”。不希望立即上线时加 `--no-publish`，之后用 `--show` 上线。云安全组仍需放行下表端口；脚本不改云厂商防火墙。
 
-### 再次运行：管理菜单
+### 再次运行：旧版 v0.3.5 管理菜单
 
 已安装的机器再次执行同一条命令，会显示当前状态并给出菜单：
 
