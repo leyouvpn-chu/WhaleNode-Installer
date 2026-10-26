@@ -14,7 +14,8 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
 
 当前显示的是使用帮助，尚未安装或修改节点。
 
-首次安装可直接不带参数运行，按中文向导填写；也可用以下参数跳过对应输入：
+不带参数运行进入统一中文数字菜单；带 --menu 可携带安装参数进入菜单。
+原有自动化参数仍直接执行，不需要通过菜单。
   --api-url 地址          节点连接后台的 HTTPS 地址
   --admin-url 地址        面板管理 API 前缀（包含 /api/v1/管理路径）
   --release-manifest 地址 发布清单，自动选择当前架构、下载地址和校验值
@@ -33,6 +34,7 @@ WhaleNode Linux 一键安装器（需 root、systemd，支持 x86_64/aarch64）
   --download-token-prompt 隐藏输入私有下载令牌（不保存）
 
 可选参数：
+  --menu                 统一数字菜单：安装、状态、扫描、IP 管理、隐藏/恢复、诊断
   --protocols vless,hy2   协议多选，默认 VLESS+REALITY 与 HY2，另支持 anytls
   --name 名称            自定义名称；省略按地区自动生成
   --host IPv4            公网入口 IP；省略自动识别
@@ -73,8 +75,9 @@ case "$ID" in
  *) echo '支持 Debian 11+、Ubuntu 22+、CentOS Stream/Rocky/AlmaLinux/RHEL 9+' >&2; exit 1 ;;
 esac
 read_only=false
+[[ "$#" -ne 0 ]] || read_only=true
 for arg in "$@"; do
-  [[ "$arg" != "--plan" && "$arg" != "--status" && "$arg" != "--check" ]] || read_only=true
+  [[ "$arg" != "--plan" && "$arg" != "--status" && "$arg" != "--check" && "$arg" != "--menu" && "$arg" != "--ip-pool" ]] || read_only=true
 done
 if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' 2>/dev/null; then
   [[ "$read_only" == false ]] || { echo '只读操作需要已有 Python 3.9+' >&2; exit 1; }
@@ -90,10 +93,10 @@ python3 -c 'import sys; assert sys.version_info >= (3,9), "需要 Python 3.9 或
 exec python3 - "$@" <<'WHALE_INSTALLER_PY'
 '''
 files={name:base64.b64encode((root/name).read_bytes()).decode() for name in
-       ('installer.py','ip_pool.py','ip_pool_cli.py','ip_pool_transaction.py')}
+       ('installer.py','ip_pool.py','ip_pool_cli.py','ip_pool_transaction.py','node_menu.py','scan_public_ips.py')}
 loader='''# Embedded IP management modules are unpacked only for the IP-pool command.
 import sys as _sys
-if _sys.argv[1:2] == ['--ip-pool']:
+if not _sys.argv[1:] or '--menu' in _sys.argv[1:] or _sys.argv[1:2] == ['--ip-pool']:
     import tempfile as _tempfile, pathlib as _pathlib, base64 as _base64, atexit as _atexit
     _bundle = _tempfile.TemporaryDirectory(prefix='whalenode-ip-pool-')
     _atexit.register(_bundle.cleanup)

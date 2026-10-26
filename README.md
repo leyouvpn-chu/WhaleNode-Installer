@@ -1,6 +1,22 @@
 # WhaleNode 一键安装器
 
-> 当前开发分支包含公网 IP 池候选功能，尚未发布。`--ip-pool` 的启停、替换操作目前只保存计划，输出 `applied=false`；生产执行适配器尚未接通，不能用于宣称自动搭建或自动换 IP 已完成。原单 IP 安装流程保持独立。
+## 统一中文数字菜单
+
+本分支提供单文件菜单入口，旧服务器也可直接下载运行，不需要事先安装扫描模块：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/feat/unified-node-menu-20261026/install.sh -o /root/whale-manager.sh && bash /root/whale-manager.sh
+```
+
+菜单包含：1 安装/续跑；2 节点与监控状态；3 公网 IPv4 扫描；4 IP 池与开机巡检；5 原节点隐藏/恢复；6 本机诊断；7 资源重新调参；8 卸载；0 退出。每次操作返回菜单，支持错误提示和取消。`bash /root/whale-manager.sh` 可重复进入。
+
+有现成的安装参数时，在原参数后添加 `--menu`，参数只传给相关操作，扫描不需要面板凭据。旧命令的 `--non-interactive`、`--status`、`--check` 等自动化调用保留；不要与 `--menu` 混用。首次安装/面板操作仍须提供原有凭据，不把管理员令牌写进公开脚本。
+
+IP 子菜单的开机/定时任务只做发现、验证和保存计划；通用批量建节点/自动换 IP 尚未接通，界面明确说明。状态页显示的是本机服务状态，不把它当成集中监控数据新鲜度或公网验收。原安装器的隐藏/恢复不包括另外创建的附加 IP 实例。检测到附加实例时阻止旧卸载与回滚删除共用核心、监控或出口规则。
+
+验证：whale-dr 109 项回归通过，包含实际控制终端按键测试。实机运行菜单与扫描不等于重新验收所有安装、发布和卸载路径；这些写入路径未为测试而在生产重跑。
+
+> 公网 IP 池的自动执行部分仍为候选功能。`--ip-pool` 的启停、替换操作目前只保存计划，输出 `applied=false`；生产执行适配器尚未接通，不能用于宣称自动搭建或自动换 IP 已完成。原单 IP 安装流程保持独立。
 
 开发分支可用入口：`bash install.sh --ip-pool status`、`scan`、`history`、`lock IP`、`unlock IP`、`pause`、`resume`、`enable IP`、`disable IP`、`replace OLD_IP NEW_IP`。`install-watch` 安装开机与定时**发现**任务，`stop-watch` 停止后续定时发现；两者均不自动更改面板。私网、CGNAT、网卡未绑定或出口验证不符的地址不能进入启用计划。
 
@@ -13,7 +29,7 @@
 以 root 登录，用下面这一整行启动安装，**不要追加 `--help`**：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/v0.3.5/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
+curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/feat/unified-node-menu-20261026/install.sh -o /root/whalenode-install.sh && bash /root/whalenode-install.sh
 ```
 
 下载地址不能直接作为 shell 命令执行。下载和执行必须使用同一个文件名。`--help` 只显示帮助，不会安装。
