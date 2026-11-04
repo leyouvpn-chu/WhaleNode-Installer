@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from ephemeral_ports import configure as configure_ephemeral_ports
 
 ROOT = Path('/var/lib/whalenode-installer')
 CONF = Path('/etc/whalenode')
@@ -549,6 +550,7 @@ def rollback(state):
     run('systemctl','disable','--now','whalenode.service',check=False)
     run('systemctl','disable','--now','whalenode-egress.service',check=False)
     if state.get('owns_egress'):run('nft','delete','table','inet','whalenode_egress',check=False)
+    restore_source_ports(state)
     path=ROOT/'sysctl-before.json'
     if path.exists():
         for key,value in json.loads(path.read_text()).items():run('sysctl','-w',key+'='+str(value))
@@ -627,6 +629,26 @@ def verify_service(state):
     failed=[item['label'] for item in report['checks'] if not item['passed']]
     if failed:raise RuntimeError('本机验收失败：'+'；'.join(failed))
 
+def tune_source_ports(state, protocols):
+    reserved=','.join(str(PROTOCOLS[p][1]) for p in protocols)
+    receipt=configure_ephemeral_ports(reserved,apply=True)
+    if not receipt.get('applied') or receipt.get('new_range')!='1024 65535':
+        raise RuntimeError('临时端口配置未通过校验，停止安装')
+    state.setdefault('ephemeral_port_backups',[]).append(receipt['backup'])
+    state['ephemeral_ports']=receipt
+    atomic(ROOT/'state.json',json.dumps(state,ensure_ascii=False,indent=2))
+    print('临时端口范围 1024–65535，保留业务端口后可用 '+str(receipt['capacity']),flush=True)
+
+
+def restore_source_ports(state):
+    for backup in reversed(state.get('ephemeral_port_backups',[])):
+        path=Path(backup)
+        if path.parent!=Path('/root') or not path.name.startswith('whale-ephemeral-max-'):
+            raise RuntimeError('临时端口备份路径不正确，停止恢复')
+        run('python3',str(path/'rollback.py'))
+    state['ephemeral_port_backups']=[]
+
+
 def tune_kernel(facts):
     """Conservative, resource-bounded settings; never rewrite driver IRQ or offload blindly.
 
@@ -675,6 +697,7 @@ def retune(state):
     if state.get('phase') not in ('installed','published') or not state.get('owns_service'):
         raise RuntimeError('本机没有由本安装器装好的 WhaleNode，无需 --retune')
     facts=resources()
+    tune_source_ports(state,state.get('protocols') or [])
     dev,shown=tune_kernel(facts)
     unit=UNIT
     text=unit.read_text()
@@ -823,6 +846,7 @@ def uninstall(args,state):
         if ours(state,admin):raise RuntimeError('面板仍有本任务节点，卸载停止；本机服务已停止，可重新运行续做')
         print('面板节点已删除；源站会在 1–2 分钟内自动删除监控和调度登记。',flush=True)
     if state.get('owns_egress'):run('nft','delete','table','inet','whalenode_egress',check=False)
+    restore_source_ports(state)
     path=ROOT/'sysctl-before.json'
     if path.exists():
         for key,value in json.loads(path.read_text()).items():run('sysctl','-w',key+'='+str(value),check=False)
@@ -1121,6 +1145,7 @@ def main(argv=None):
         state['owns_egress']=True;save('egress')
         run('nft','-f',str(nft))
     atomic('/etc/systemd/system/whalenode-egress.service','[Unit]\nBefore=whalenode.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/whalenode-egress.nft\nExecStop=/usr/sbin/nft delete table inet whalenode_egress\n[Install]\nWantedBy=multi-user.target\n',0o644)
+    tune_source_ports(state,selected)
     tune_kernel(facts)
     unit='[Unit]\nDescription=WhaleNode\nAfter=network-online.target whalenode-egress.service\nRequires=whalenode-egress.service\nWants=network-online.target\n[Service]\nUser=whalenode\nGroup=whalenode\nWorkingDirectory='+str(CONF)+'\nUMask=0077\nEnvironment=GOMEMLIMIT='+str(facts['go_memory_mib'])+'MiB\nEnvironment=GOMAXPROCS='+str(facts['cpus'])+'\nExecStart='+str(binary)+' server -c '+str(CONF/'config.json')+'\nRestart=always\nRestartSec=5\nLimitNOFILE=262144\nNoNewPrivileges=true\nProtectHome=true\nProtectSystem=strict\nReadWritePaths='+str(CONF)+'\n[Install]\nWantedBy=multi-user.target\n'
     atomic('/etc/systemd/system/whalenode.service',unit,0o644)
