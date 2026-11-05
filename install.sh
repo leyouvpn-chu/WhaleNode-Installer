@@ -79,6 +79,10 @@ if ! command -v python3 >/dev/null || ! python3 -c 'import sys; sys.exit(0 if sy
 fi
 python3 -c 'import sys; assert sys.version_info >= (3,9), "需要 Python 3.9 或更新版本"'
 exec python3 - "$@" <<'WHALE_INSTALLER_PY'
+import sys,types
+_ep=types.ModuleType("ephemeral_ports")
+exec('"""Maximize non-privileged source ports without consuming service/hopping ports.\n\nNo service restart, dependency install, TCP timeout or durability changes.\nThe same implementation is used by node_build and scoped online maintenance.\n"""\nfrom pathlib import Path\nimport hashlib\nimport json\nimport os\nimport subprocess\nimport tempfile\n\nLOW, HIGH = 1024, 65535\nPERSIST = \'/etc/sysctl.d/zz-whale-ephemeral.conf\'\nROLLBACK = r\'\'\'from pathlib import Path\nimport json, hashlib, fcntl, os, tempfile\nroot=Path(__file__).resolve().parent\nwith open(\'/run/lock/whale-ephemeral.lock\',\'a\') as lock:\n fcntl.flock(lock,fcntl.LOCK_EX)\n m=json.loads((root/\'receipt.json\').read_text())\n base=Path(\'/proc/sys/net/ipv4\');p=Path(m[\'persistent_path\'])\n assert (base/\'ip_local_port_range\').read_text().split()==m[\'new_range\'].split(),\'Range changed; review rollback\'\n assert (base/\'ip_local_reserved_ports\').read_text().strip()==m[\'new_reserved\'],\'Reservations changed; review rollback\'\n assert hashlib.sha256(p.read_bytes()).hexdigest()==m[\'persistent_sha256\'],\'Persistent file changed; review rollback\'\n old=root/\'persistent.before\'\n if old.exists():\n  fd,name=tempfile.mkstemp(prefix=\'.whale-port-rollback-\',dir=str(p.parent))\n  with os.fdopen(fd,\'wb\') as f:f.write(old.read_bytes());f.flush();os.fsync(f.fileno())\n  os.chmod(name,0o644);os.replace(name,p)\n else:p.unlink()\n (base/\'ip_local_port_range\').write_text(m[\'old_range\']+\'\\n\')\n (base/\'ip_local_reserved_ports\').write_text(m[\'old_reserved\']+\'\\n\')\n print(\'Restored only this port-pool change; no services restarted\')\n\'\'\'\n\n\ndef expand(value):\n    ports = set()\n    for part in str(value).split(\',\'):\n        if not part.strip():\n            continue\n        ends = [int(n) for n in part.strip().split(\'-\')]\n        if len(ends) > 2 or not 1 <= ends[0] <= ends[-1] <= HIGH:\n            raise ValueError(\'Invalid reserved port range\')\n        ports.update(range(ends[0], ends[-1] + 1))\n    return ports\n\n\ndef compact(ports):\n    spans = []\n    for n in sorted(ports):\n        if spans and n == spans[-1][1] + 1:\n            spans[-1][1] = n\n        else:\n            spans.append([n, n])\n    return \',\'.join(str(a) if a == b else \'%d-%d\' % (a, b) for a, b in spans)\n\n\ndef listener_ports(output, old_range):\n    """ss UDP UNCONN includes outbound sockets: never reserve the entire pool.\n\n    TCP LISTEN, specifically bound UDP and wildcard UDP outside the old ephemeral\n    range are service candidates. In-range wildcard services must be provided by\n    the deployment plan (or existing reservations), e.g. HY2 on port 24443.\n    """\n    ports = set()\n    for line in output.splitlines():\n        fields = line.split()\n        if len(fields) < 5 or fields[0] not in (\'tcp\', \'udp\'):\n            continue\n        address, port = fields[4].rsplit(\':\', 1)\n        if port.isdigit() and (fields[0] == \'tcp\' or\n                              address not in (\'*\', \'0.0.0.0\', \'[::]\', \'::\') or\n                              not old_range[0] <= int(port) <= old_range[1]):\n            ports.add(int(port))\n    return ports\n\n\ndef atomic_write(path, raw):\n    path = Path(path)\n    fd, name = tempfile.mkstemp(prefix=\'.\' + path.name, dir=str(path.parent))\n    try:\n        with os.fdopen(fd, \'wb\') as handle:\n            handle.write(raw)\n            handle.flush()\n            os.fsync(handle.fileno())\n        os.chmod(name, 0o644)\n        os.replace(name, path)\n    finally:\n        if os.path.exists(name):\n            os.unlink(name)\n\n\ndef configure(extra_reserved=\'\', apply=False):\n    import fcntl  # Remote Linux only; source generation also runs on Windows.\n    if os.geteuid() != 0:\n        raise PermissionError(\'Requires existing root or noninteractive sudo\')\n    with open(\'/run/lock/whale-ephemeral.lock\', \'a\') as lock:\n        fcntl.flock(lock, fcntl.LOCK_EX)\n        base = Path(\'/proc/sys/net/ipv4\')\n        range_path = base / \'ip_local_port_range\'\n        reserved_path = base / \'ip_local_reserved_ports\'\n        old_range = range_path.read_text().strip()\n        old_reserved = reserved_path.read_text().strip()\n        low, high = map(int, old_range.split())\n        boundary = base / \'ip_unprivileged_port_start\'\n        # Older Linux kernels predate this setting and use the fixed 1024 boundary.\n        privileged = int(boundary.read_text()) if boundary.exists() else 1024\n        if privileged > LOW:\n            raise ValueError(\'Nonstandard privileged-port boundary; review before expanding\')\n        listeners = subprocess.check_output([\'ss\', \'-H\', \'-lntu\'], text=True, timeout=20)\n        reserved = expand(old_reserved) | expand(extra_reserved) | listener_ports(listeners, (low, high))\n        new_reserved = compact(reserved)\n        capacity = HIGH - LOW + 1 - sum(LOW <= n <= HIGH for n in reserved)\n        if capacity < 16384:\n            raise ValueError(\'Reserved ports leave insufficient capacity; review plan\')\n        body = (\'# Managed by Whale ephemeral_ports.py; preserve service and hopping reservations.\\n\'\n                \'net.ipv4.ip_local_reserved_ports = \' + new_reserved + \'\\n\'\n                \'net.ipv4.ip_local_port_range = %d %d\\n\' % (LOW, HIGH)).encode()\n        path = Path(PERSIST)\n        previous = path.read_bytes() if path.exists() else None\n        result = {\'old_range\': old_range, \'new_range\': \'%d %d\' % (LOW, HIGH),\n                  \'old_reserved\': old_reserved, \'new_reserved\': new_reserved,\n                  \'capacity\': capacity, \'applied\': False, \'persistent_path\': PERSIST,\n                  \'persistent_sha256\': hashlib.sha256(body).hexdigest()}\n        if not apply:\n            return result\n        backup = Path(tempfile.mkdtemp(prefix=\'whale-ephemeral-max-\', dir=\'/root\'))\n        os.chmod(backup, 0o700)\n        if previous is not None:\n            (backup / \'persistent.before\').write_bytes(previous)\n        result[\'backup\'] = str(backup)\n        (backup / \'before.json\').write_text(json.dumps(result, indent=2))\n        try:\n            # Reserve before expansion so services never enter automatic allocation.\n            reserved_path.write_text(new_reserved + \'\\n\')\n            range_path.write_text(result[\'new_range\'] + \'\\n\')\n            atomic_write(path, body)\n            assert range_path.read_text().split() == [str(LOW), str(HIGH)]\n            assert expand(reserved_path.read_text()) == reserved\n            assert path.read_bytes() == body\n            result[\'applied\'] = True\n            (backup / \'receipt.json\').write_text(json.dumps(result, indent=2))\n            (backup / \'rollback.py\').write_text(ROLLBACK)\n            (backup / \'rollback.py\').chmod(0o700)\n            return result\n        except Exception:\n            # Restore only our exact writes; never overwrite concurrent external edits.\n            if range_path.read_text().split() == [str(LOW), str(HIGH)]:\n                range_path.write_text(old_range + \'\\n\')\n            if reserved_path.read_text().strip() == new_reserved:\n                reserved_path.write_text(old_reserved + \'\\n\')\n            if path.exists() and path.read_bytes() == body:\n                if previous is None:\n                    path.unlink()\n                else:\n                    atomic_write(path, previous)\n            raise\n\n\ndef remote_script(extra_reserved=\'\', apply=True):\n    # No credentials or target data are embedded beyond explicit reserved ports.\n    return (Path(__file__).read_text(encoding=\'utf-8\') +\n            \'\\nprint(json.dumps(configure(%r, apply=%r)))\\n\' % (extra_reserved, apply))\n',_ep.__dict__)
+sys.modules["ephemeral_ports"]=_ep
 """WhaleNode 服务器本机安装器，仅依赖 Python 标准库。"""
 import argparse
 from collections import Counter
@@ -106,6 +110,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from ephemeral_ports import configure as configure_ephemeral_ports
 
 ROOT = Path('/var/lib/whalenode-installer')
 CONF = Path('/etc/whalenode')
@@ -630,6 +635,7 @@ def rollback(state):
     run('systemctl','disable','--now','whalenode.service',check=False)
     run('systemctl','disable','--now','whalenode-egress.service',check=False)
     if state.get('owns_egress'):run('nft','delete','table','inet','whalenode_egress',check=False)
+    restore_source_ports(state)
     path=ROOT/'sysctl-before.json'
     if path.exists():
         for key,value in json.loads(path.read_text()).items():run('sysctl','-w',key+'='+str(value))
@@ -708,6 +714,26 @@ def verify_service(state):
     failed=[item['label'] for item in report['checks'] if not item['passed']]
     if failed:raise RuntimeError('本机验收失败：'+'；'.join(failed))
 
+def tune_source_ports(state, protocols):
+    reserved=','.join(str(PROTOCOLS[p][1]) for p in protocols)
+    receipt=configure_ephemeral_ports(reserved,apply=True)
+    if not receipt.get('applied') or receipt.get('new_range')!='1024 65535':
+        raise RuntimeError('临时端口配置未通过校验，停止安装')
+    state.setdefault('ephemeral_port_backups',[]).append(receipt['backup'])
+    state['ephemeral_ports']=receipt
+    atomic(ROOT/'state.json',json.dumps(state,ensure_ascii=False,indent=2))
+    print('临时端口范围 1024–65535，保留业务端口后可用 '+str(receipt['capacity']),flush=True)
+
+
+def restore_source_ports(state):
+    for backup in reversed(state.get('ephemeral_port_backups',[])):
+        path=Path(backup)
+        if path.parent!=Path('/root') or not path.name.startswith('whale-ephemeral-max-'):
+            raise RuntimeError('临时端口备份路径不正确，停止恢复')
+        run('python3',str(path/'rollback.py'))
+    state['ephemeral_port_backups']=[]
+
+
 def tune_kernel(facts):
     """Conservative, resource-bounded settings; never rewrite driver IRQ or offload blindly.
 
@@ -756,6 +782,7 @@ def retune(state):
     if state.get('phase') not in ('installed','published') or not state.get('owns_service'):
         raise RuntimeError('本机没有由本安装器装好的 WhaleNode，无需 --retune')
     facts=resources()
+    tune_source_ports(state,state.get('protocols') or [])
     dev,shown=tune_kernel(facts)
     unit=UNIT
     text=unit.read_text()
@@ -904,6 +931,7 @@ def uninstall(args,state):
         if ours(state,admin):raise RuntimeError('面板仍有本任务节点，卸载停止；本机服务已停止，可重新运行续做')
         print('面板节点已删除；源站会在 1–2 分钟内自动删除监控和调度登记。',flush=True)
     if state.get('owns_egress'):run('nft','delete','table','inet','whalenode_egress',check=False)
+    restore_source_ports(state)
     path=ROOT/'sysctl-before.json'
     if path.exists():
         for key,value in json.loads(path.read_text()).items():run('sysctl','-w',key+'='+str(value),check=False)
@@ -1202,6 +1230,7 @@ def main(argv=None):
         state['owns_egress']=True;save('egress')
         run('nft','-f',str(nft))
     atomic('/etc/systemd/system/whalenode-egress.service','[Unit]\nBefore=whalenode.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/whalenode-egress.nft\nExecStop=/usr/sbin/nft delete table inet whalenode_egress\n[Install]\nWantedBy=multi-user.target\n',0o644)
+    tune_source_ports(state,selected)
     tune_kernel(facts)
     unit='[Unit]\nDescription=WhaleNode\nAfter=network-online.target whalenode-egress.service\nRequires=whalenode-egress.service\nWants=network-online.target\n[Service]\nUser=whalenode\nGroup=whalenode\nWorkingDirectory='+str(CONF)+'\nUMask=0077\nEnvironment=GOMEMLIMIT='+str(facts['go_memory_mib'])+'MiB\nEnvironment=GOMAXPROCS='+str(facts['cpus'])+'\nExecStart='+str(binary)+' server -c '+str(CONF/'config.json')+'\nRestart=always\nRestartSec=5\nLimitNOFILE=262144\nNoNewPrivileges=true\nProtectHome=true\nProtectSystem=strict\nReadWritePaths='+str(CONF)+'\n[Install]\nWantedBy=multi-user.target\n'
     atomic('/etc/systemd/system/whalenode.service',unit,0o644)
