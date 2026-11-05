@@ -83,4 +83,6 @@ fi
 python3 -c 'import sys; assert sys.version_info >= (3,9), "需要 Python 3.9 或更新版本"'
 exec python3 - "$@" <<'WHALE_INSTALLER_PY'
 '''
-(root/'install.sh').write_text(prefix+(root/'installer.py').read_text(encoding='utf-8')+'\nWHALE_INSTALLER_PY\n',encoding='utf-8',newline='\n')
+ports=(root/'ephemeral_ports.py').read_text(encoding='utf-8')
+embedded='import sys,types\n_ep=types.ModuleType("ephemeral_ports")\nexec('+repr(ports)+',_ep.__dict__)\nsys.modules["ephemeral_ports"]=_ep\n'
+(root/'install.sh').write_text(prefix+embedded+(root/'installer.py').read_text(encoding='utf-8')+'\nWHALE_INSTALLER_PY\n',encoding='utf-8',newline='\n')

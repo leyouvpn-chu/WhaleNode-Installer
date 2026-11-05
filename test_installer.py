@@ -7,6 +7,19 @@ from unittest.mock import patch
 import installer as i
 
 class Tests(unittest.TestCase):
+    def test_source_ports_preserve_plan_and_record_rollback(self):
+        receipt={'applied':True,'new_range':'1024 65535','capacity':64509,'backup':'/root/whale-ephemeral-max-test'}
+        with tempfile.TemporaryDirectory() as directory,patch.object(i,'ROOT',Path(directory)),patch.object(i,'configure_ephemeral_ports',return_value=receipt) as configure,patch('sys.stdout',new_callable=io.StringIO):
+            state={};i.tune_source_ports(state,['vless','hy2'])
+            configure.assert_called_once_with('28443,24443',apply=True)
+            self.assertEqual(json.loads((Path(directory)/'state.json').read_text())['ephemeral_port_backups'],[receipt['backup']])
+    def test_source_ports_reject_unverified_apply(self):
+        with patch.object(i,'configure_ephemeral_ports',return_value={'applied':False}),self.assertRaises(RuntimeError):
+            i.tune_source_ports({},['hy2'])
+    def test_source_port_rollback_rejects_foreign_path(self):
+        with patch.object(i,'run') as run,self.assertRaises(RuntimeError):
+            i.restore_source_ports({'ephemeral_port_backups':['/etc/other-task']})
+        run.assert_not_called()
     def setUp(self):
         self.root_patch=patch.object(i.os,'geteuid',return_value=0)
         self.root_patch.start()
@@ -447,7 +460,7 @@ class PanelLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             unit=Path(d)/'whalenode.service';unit.write_text(unit_text)
             with patch.object(i,'ROOT',Path(d)),patch.object(i,'UNIT',unit),patch.object(i,'resources',return_value=facts),\
-                 patch.object(i,'tune_kernel',return_value=('eth0','qdisc fq_codel 1: root')),patch.object(i,'wait_listening',return_value=[]),\
+                 patch.object(i,'tune_source_ports'),patch.object(i,'tune_kernel',return_value=('eth0','qdisc fq_codel 1: root')),patch.object(i,'wait_listening',return_value=[]),\
                  patch.object(i,'verify_service'),patch.object(i,'run',side_effect=lambda *a,check=True:calls.append(a) or type('R',(),{'returncode':0,'stdout':''})()),\
                  patch('sys.stdout',new_callable=io.StringIO):
                 i.retune(state)
