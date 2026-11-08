@@ -724,6 +724,24 @@ def rows(response):
     if not isinstance(data, list): raise RuntimeError('V2Board getNodes 响应格式不兼容')
     return data
 
+# 线路名称不准带 IP（owner 2026-11-07）：点分或横线分隔的 IPv4 都算。
+NAME_IP=re.compile(r'\d{1,3}([.-])\d{1,3}\1\d{1,3}\1\d{1,3}')
+
+def settle_name(state,all_nodes):
+    """本机线路名称的前缀（协议名之前那段）。
+    已有本任务的面板行 → 以面板为准（后台可能已改名）；否则自动命名 = 地区 + 两位编号，
+    编号取面板里同地区还没人用的最小值。旧版装机留下的带 IP 名称在这里去掉 IP 重新编号。"""
+    own=[str(x.get('name') or '') for x in all_nodes if state.get('nonce') in (x.get('tags') or [])]
+    own=[n.split(' · ')[0] for n in own if ' · ' in n and not NAME_IP.search(n)]
+    if own: return own[0]
+    name=state['name']
+    if NAME_IP.search(name):
+        name=re.sub(r'[\s._-]+$','',re.sub(r'\s+',' ',NAME_IP.sub('',name))).strip();state['name_auto']=True
+    if not state.get('name_auto') or re.search(r' \d{2}$',name): return name
+    used={str(x.get('name') or '') for x in all_nodes}
+    n=1
+    while any(u.startswith('%s %02d · '%(name,n)) for u in used): n+=1
+    return '%s %02d'%(name,n)
 MARK='wn-installer'
 
 def save_state(state,phase=None):
@@ -1010,12 +1028,16 @@ def main(argv=None):
         geo = ipv4_request('https://ipwho.is/')
         if geo.get('success') is not True: raise RuntimeError('地区识别失败，请提供 --host 和 --name')
         state['host'] = str(ipaddress.IPv4Address(geo['ip']))
-        state.setdefault('name', str(geo['country_code']) + ' ' + str(geo['city']) + ' ' + state['host'])
+        if not state.get('name'):
+            # 线路名称不准带 IP（owner 2026-11-07）。先记地区，编号等拿到面板清单后再定。
+            state['name'] = str(geo['country_code']) + ' ' + str(geo['city']); state['name_auto'] = True
     state['host'] = str(ipaddress.IPv4Address(state['host']))
     if not state.get('name'):
         geo = ipv4_request('https://ipwho.is/' + state['host'])
         if geo.get('success') is not True: raise RuntimeError('地区识别失败，请提供 --name')
-        state['name'] = str(geo['country_code']) + ' ' + str(geo['city']) + ' ' + state['host']
+        state['name'] = str(geo['country_code']) + ' ' + str(geo['city']); state['name_auto'] = True
+    if NAME_IP.search(state['name']) and not state.get('ids'):
+        raise ValueError('节点名称不能包含 IP 地址：'+state['name'])
     if len(state['name']) > 80 or any(ord(c)<32 for c in state['name']): raise ValueError('节点名称无效')
     def ids(value):
         out = [int(x) for x in value.split(',') if x]
@@ -1049,6 +1071,7 @@ def main(argv=None):
     # Owned listeners remain online during preflight; foreign owners still fail.
     check_install_ports(selected,running_pid)
     all_nodes = rows(request(state['admin_url']+'/server/manage/getNodes',admin))
+    state['name']=settle_name(state,all_nodes);save('preflight')
     if not state.get('node_group'):
         state['node_group']=resume_group(args.node_group,state,all_nodes)
         save('preflight')

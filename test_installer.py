@@ -7,6 +7,19 @@ from unittest.mock import patch
 import installer as i
 
 class Tests(unittest.TestCase):
+    def test_auto_name_has_no_ip_and_takes_next_free_number(self):
+        nodes=[{'name':'GB London 01 · HY2'},{'name':'GB London 02 · VLESS'},{'name':'GB Londonderry 03 · HY2'}]
+        self.assertEqual(i.settle_name({'name':'GB London','name_auto':True,'nonce':'n1'},nodes),'GB London 03')
+    def test_existing_rows_keep_panel_name_even_if_state_has_ip(self):
+        nodes=[{'name':'GB London 01 · HY2','tags':['n1']},{'name':'GB London 02 · HY2','tags':['n2']}]
+        self.assertEqual(i.settle_name({'name':'GB London 79.98.35.31','nonce':'n1','ids':{'hy2':1}},nodes),'GB London 01')
+    def test_legacy_ip_name_is_renumbered(self):
+        self.assertEqual(i.settle_name({'name':'DE Karlsruhe 62.83.39.9','nonce':'n9'},[{'name':'DE Karlsruhe 01 · HY2'}]),'DE Karlsruhe 02')
+        self.assertEqual(i.settle_name({'name':'NODE-45-84-242-77','nonce':'n9'},[]),'NODE 01')
+    def test_explicit_name_kept(self):
+        self.assertEqual(i.settle_name({'name':'Custom Edge','nonce':'n1'},[{'name':'Custom Edge · HY2'}]),'Custom Edge')
+        self.assertIsNotNone(i.NAME_IP.search('GB London 79.98.35.31'))
+        self.assertIsNone(i.NAME_IP.search('GB London 01 · HY2'))
     def test_source_ports_preserve_plan_and_record_rollback(self):
         receipt={'applied':True,'new_range':'1024 65535','capacity':64509,'backup':'/root/whale-ephemeral-max-test'}
         with tempfile.TemporaryDirectory() as directory,patch.object(i,'ROOT',Path(directory)),patch.object(i,'configure_ephemeral_ports',return_value=receipt) as configure,patch('sys.stdout',new_callable=io.StringIO):
