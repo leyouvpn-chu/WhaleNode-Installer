@@ -7,6 +7,13 @@ from unittest.mock import patch
 import installer as i
 
 class Tests(unittest.TestCase):
+    def test_publish_flags_preserve_tristate_and_last_option(self):
+        parser=i.parser()
+        self.assertIsNone(parser.parse_args([]).publish)
+        self.assertIs(parser.parse_args(['--publish']).publish,True)
+        self.assertIs(parser.parse_args(['--no-publish']).publish,False)
+        self.assertIs(parser.parse_args(['--publish','--no-publish']).publish,False)
+        self.assertIs(parser.parse_args(['--no-publish','--publish']).publish,True)
     def test_auto_name_has_no_ip_and_takes_next_free_number(self):
         nodes=[{'name':'GB London 01 · HY2'},{'name':'GB London 02 · VLESS'},{'name':'GB Londonderry 03 · HY2'}]
         self.assertEqual(i.settle_name({'name':'GB London','name_auto':True,'nonce':'n1'},nodes),'GB London 03')
@@ -57,7 +64,8 @@ class Tests(unittest.TestCase):
                 done, status = os.waitpid(pid, os.WNOHANG)
                 if done:
                     pid = 0
-                    self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+                    self.assertTrue(os.WIFEXITED(status))
+                    self.assertEqual(os.WEXITSTATUS(status), 0)
                     break
                 time.sleep(.02)
             else: self.fail('Terminal input did not finish')

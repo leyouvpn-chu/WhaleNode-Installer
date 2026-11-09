@@ -145,8 +145,11 @@ def parser():
     mode.add_argument('--show', action='store_true', help='面板重新显示本机节点')
     mode.add_argument('--uninstall', action='store_true', help='隐藏并删除面板节点，卸载本机服务和监控')
     p.add_argument('--yes', action='store_true', help='卸载时不再确认')
-    p.add_argument('--publish', action=argparse.BooleanOptionalAction, default=None,
+    # BooleanOptionalAction was introduced in Python 3.9 (Ubuntu 20.04 has 3.8).
+    p.add_argument('--publish', action='store_true', default=None,
                    help='安装后直接在面板显示（默认开启；--no-publish 保持隐藏）')
+    p.add_argument('--no-publish', dest='publish', action='store_false', default=None,
+                   help='安装后保持面板隐藏')
     p.add_argument('--node-group', help='网关节点分组，默认 legacy_all')
     return p
 
@@ -545,7 +548,16 @@ def dependency_check():
         run('dnf','install','-y','nftables','iproute','procps-ng','kmod','shadow-utils','util-linux','ca-certificates')
     else:raise RuntimeError('无法安装依赖：未找到 apt-get 或 dnf')
 
+def has_additional_ip_instances():
+    path=ROOT/'ip-pool.json'
+    if path.exists():
+        data=json.loads(path.read_text())
+        if any(e.get('unit') or e.get('slot') for e in data.get('addresses',{}).values()):return True
+    return any(p.name!='whalenode-ip-pool.service' for p in Path('/etc/systemd/system').glob('whalenode-ip-*.service'))
+
+
 def rollback(state):
+    if has_additional_ip_instances():raise RuntimeError('存在附加 IP 实例，不能回滚共用出口规则或原服务；请先逐实例处理')
     if not state.get('owns_service') and not state.get('owns_egress'):raise RuntimeError('本任务尚未修改服务或系统参数，无需回滚')
     run('systemctl','disable','--now','whalenode.service',check=False)
     run('systemctl','disable','--now','whalenode-egress.service',check=False)
@@ -844,6 +856,7 @@ def remove_monitor(state):
         run('systemctl','restart','zabbix-agent2',check=False)
 
 def uninstall(args,state):
+    if has_additional_ip_instances():raise RuntimeError('存在附加 IP 实例，不能删除共用核心、配置和监控；请先逐实例处理')
     if not state.get('ids') and not state.get('owns_service'):raise RuntimeError('本机没有安装器任务，无需卸载')
     if not args.yes:
         if args.non_interactive:raise ValueError('非交互卸载需要 --yes 确认')
@@ -852,6 +865,11 @@ def uninstall(args,state):
     admin=admin_token(args) if state.get('ids') else None
     if admin and state.get('published'):
         set_show(state,admin,0);print('面板已隐藏。',flush=True)
+    if Path('/etc/systemd/system/whalenode-ip-pool.timer').exists():
+        run('systemctl','disable','--now','whalenode-ip-pool.timer',check=False)
+        run('systemctl','stop','whalenode-ip-pool.service',check=False)
+        for name in ('whalenode-ip-pool.timer','whalenode-ip-pool.service'):
+            (Path('/etc/systemd/system')/name).unlink(missing_ok=True)
     run('systemctl','disable','--now','whalenode.service',check=False)
     run('systemctl','disable','--now','whalenode-egress.service',check=False)
     if admin:
@@ -1205,7 +1223,14 @@ def finish(args,state,admin=None):
     print('管理：再次运行本脚本可选择 面板隐藏 / 重新显示 / 卸载；或直接用 --hide、--show、--uninstall。')
 
 if __name__=='__main__':
-    try:main()
+    try:
+        if not sys.argv[1:] or '--menu' in sys.argv[1:]:
+            import node_menu
+            node_menu.main([arg for arg in sys.argv[1:] if arg!='--menu'])
+        elif sys.argv[1:2]==['--ip-pool']:
+            import ip_pool_cli
+            ip_pool_cli.main(sys.argv[2:])
+        else:main()
     except (Exception,KeyboardInterrupt) as e:
         # Do not emit exception URLs, request bodies, credentials or stack locals.
         print('操作未完成：'+(str(e) if isinstance(e,(RuntimeError,ValueError)) else type(e).__name__),file=sys.stderr)

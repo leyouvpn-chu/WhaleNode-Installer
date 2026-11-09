@@ -1,5 +1,7 @@
 # WhaleNode 一键安装器
 
+Ubuntu 20.04 / Debian 11 兼容入口及验证范围见 [系统兼容性说明](docs/reference/ubuntu20-debian11.md)。
+
 源码分支新增：安装与 `--retune` 会设置临时端口范围 `1024–65535`，合并保留
 已有预留和所选协议监听端口，写入后读回验证，失败停止安装。已有业务预留不清空，
 不改变 TCP 超时；此项自身无需重启服务。`--rollback`/卸载使用带状态校验的备份
@@ -25,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/leyouvpn-chu/WhaleNode-Installer/7f
 0 退出
 ```
 
-以后运行 `bash /root/whale-manager.sh` 返回菜单。通过 SSH 交互终端以 root 运行，需要 Python 3.9+；公网扫描还需要 iproute2、curl 和 CA 证书。菜单入口不会自动补装这些依赖。
+以后运行 `bash /root/whale-manager.sh` 返回菜单。通过 SSH 交互终端以 root 运行，需要 Python 3.8+；公网扫描还需要 iproute2、curl 和 CA 证书。菜单入口不会自动补装这些依赖。
 
 ### 运维带参数入口
 
@@ -186,7 +188,7 @@ python3 make_manifest.py --archive whalenode.gz \
 
 ## 系统与调优
 
-需 root、systemd、至少 768 MiB 可用配额内存，以及 512 MiB 安装磁盘空间。发行版入口允许 Debian 11+、Ubuntu 22+、CentOS Stream/Rocky/AlmaLinux/RHEL 9+；不支持 CentOS 7/8、Alpine 或无 systemd 容器。架构支持 x86_64/aarch64，但实际可安装性取决于运营方提供相应后端制品。
+需 root、systemd、至少 768 MiB 可用配额内存，以及 512 MiB 安装磁盘空间。发行版入口允许 Debian 11+、Ubuntu 20.04+、CentOS Stream/Rocky/AlmaLinux/RHEL 9+；不支持 CentOS 7/8、Alpine 或无 systemd 容器。架构支持 x86_64/aarch64，但实际可安装性取决于运营方提供相应后端制品。
 
 - 根据 CPU affinity 和 cgroup 配额设置 `GOMAXPROCS`。
 - 根据主机/cgroup 内存上限设置 `GOMEMLIMIT` 和有界 socket 缓冲区。
@@ -207,7 +209,7 @@ python3 make_manifest.py --archive whalenode.gz \
 
 `--check` 不安装软件、不重启服务、不改规则；成功退出码为 0，任何必需检查失败退出码为 1。它检查服务是否运行、进程实际文件哈希、专用用户、配置权限、面板/节点绑定、各协议监听，以及 nftables 中首条规则是否确实拒绝专用用户 IPv6 出口。规则表存在但规则丢失，不能通过。已安装任务重复执行也会做这些检查。
 
-`--status` 和 `--check` 在未安装的新机器上不会创建任务目录；只读操作需要机器已有 Python 3.9+。
+`--status` 和 `--check` 在未安装的新机器上不会创建任务目录；只读操作需要机器已有 Python 3.8+。
 
 `--report-file` 输出 JSON，采用字段白名单，不包含面板地址、API Key、管理员令牌、私有下载地址或下载令牌。文件权限 0600，已有路径或符号链接会拒绝覆盖。即使检查失败也会保留报告，便于定位。报告仍包含节点 IP、名称、节点 ID、版本和资源信息，仅交给可信运维人员，不要公开上传资产信息。
 
