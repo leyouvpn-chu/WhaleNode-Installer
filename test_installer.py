@@ -454,6 +454,7 @@ class PanelLifecycleTests(unittest.TestCase):
         calls,written,(dev,shown)=self._kernel(['qdisc fq 8001: root refcnt 2 limit 10000p flow_limit 100p','qdisc fq_codel 8002: root refcnt 2'])
         conf=written['/etc/sysctl.d/90-whalenode.conf']
         self.assertIn('net.core.default_qdisc=fq_codel\n',conf)
+        self.assertIn('net.core.rmem_default=8388608\n',conf)
         self.assertNotIn('default_qdisc=fq\n',conf)
         self.assertIn(('tc','qdisc','replace','dev','eth0','root','fq_codel'),calls)
         self.assertEqual((dev,shown.split()[1]),('eth0','fq_codel'))
