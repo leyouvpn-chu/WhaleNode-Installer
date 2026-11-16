@@ -655,8 +655,12 @@ def tune_kernel(facts):
     The queueing discipline must be fq_codel, not fq: a sing hysteria2 inbound is a single UDP
     socket, and fq treats a socket as one flow with a 100-packet flow_limit, so under load it
     dropped the machine's entire HY2 traffic (fleet finding 2026-09-16; v0.3.4 and earlier set fq).
-    Returns the default-route device and its qdisc after the change."""
-    settings={'net.core.somaxconn':8192,'net.core.rmem_max':facts['socket_buffer'],'net.core.wmem_max':facts['socket_buffer'],'net.ipv4.tcp_mtu_probing':1,'net.core.default_qdisc':'fq_codel'}
+    Returns the default-route device and its qdisc after the change.
+
+    rmem_default matters as much as rmem_max: whalenode's HY2 listen sockets do not set SO_RCVBUF,
+    so they get the system default (212992, or 65536 on some images) and overflowed under load
+    (UdpRcvbufErrors on 17 fleet nodes, 2026-11-16; 8 MiB fixed it). Capped by socket_buffer on small boxes."""
+    settings={'net.core.somaxconn':8192,'net.core.rmem_max':facts['socket_buffer'],'net.core.rmem_default':min(8388608,facts['socket_buffer']),'net.core.wmem_max':facts['socket_buffer'],'net.ipv4.tcp_mtu_probing':1,'net.core.default_qdisc':'fq_codel'}
     old=json.loads((ROOT/'sysctl-before.json').read_text()) if (ROOT/'sysctl-before.json').exists() else {}
     for k in settings:
         if k not in old: old[k]=run('sysctl','-n',k).stdout.strip()
